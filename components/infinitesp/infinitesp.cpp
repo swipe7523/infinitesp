@@ -363,6 +363,29 @@ void InfinitESPComponent::dispatch_frame_() {
   bool to_us = (sam_enabled() && current_frame_.dst == sam_address_);
   bool to_zc = (zc_enabled() && current_frame_.dst == zc_address_);
 
+  // --- SAM enrollment diagnostic ---
+  // The thermostat only *initiates* reads/writes to a SAM it has enrolled in
+  // its boot-time bus device table. A REPLY addressed to us is just the
+  // thermostat answering one of our own polls and does NOT prove enrollment;
+  // a READ/WRITE that it originates toward us does. Latch the first such frame
+  // at INFO (the "it appeared" moment) and downgrade repeats to DEBUG so an
+  // enrolled SAM's periodic reads don't flood the log.
+  if (to_us && (current_frame_.func == FUNC_READ || current_frame_.func == FUNC_WRITE)) {
+    static bool sam_discovery_seen = false;
+    uint16_t probe_reg = current_frame_.payload.size() >= 3
+                             ? (current_frame_.payload[1] << 8) | current_frame_.payload[2]
+                             : 0;
+    if (!sam_discovery_seen) {
+      sam_discovery_seen = true;
+      ESP_LOGI("InfinitESP",
+               "SAM DISCOVERY: %02X originated %s reg=%04X to SAM %02X -- enrollment confirmed",
+               current_frame_.src, func_name, probe_reg, sam_address_);
+    } else {
+      ESP_LOGD("InfinitESP", "SAM addressed by %02X: %s reg=%04X",
+               current_frame_.src, func_name, probe_reg);
+    }
+  }
+
   // Reply matching: if this is a REPLY addressed to us, check against pending polls
   if (current_frame_.func == FUNC_REPLY && to_us) {
     diag_reply_received_++;
