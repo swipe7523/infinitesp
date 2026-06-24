@@ -139,7 +139,7 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
         float fval = parent_->odu_float_(*data, idx);
         if (!std::isnan(fval)) {
           if (idx <= 5)
-            value = (fval - 32.0f) * (5.0f / 9.0f);  // °F → °C
+            value = fval * (5.0f / 9.0f);  // °F delta → °C delta (no -32 offset)
           else
             value = fval;  // float 6 is dimensionless
         }

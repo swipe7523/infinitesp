@@ -800,6 +800,16 @@ void InfinitESPComponent::handle_reply_() {
         ESP_LOGD("InfinitESP", "3B02 reply: weekday=%u minutes=%u (%02u:%02u)",
                  data[REG3B02_WEEKDAY], minutes, minutes / 60, minutes % 60);
       }
+      // Raw payload dump — diagnose zone gating: byte 0 = active_zones mask.
+      // If byte 0 is 00 the climate entities all early-return; if the real
+      // mask appears at a different offset, our REG3B02_* offsets are shifted.
+      if (reg_key == REG_SAM_STATE) {
+        char hex[REG3B02_SIZE * 3 + 1] = {};
+        for (size_t i = 0; i < data.size() && i < REG3B02_SIZE; i++)
+          snprintf(hex + i * 3, 4, "%02X ", data[i]);
+        ESP_LOGD("InfinitESP", "3B02 raw (%u bytes): active=%02X [%s]",
+                 (unsigned) data.size(), data.empty() ? 0 : data[REG3B02_ACTIVE_ZONES], hex);
+      }
 
       // Heuristic bus unit detection (AUTO mode only)
       // On every 3B02 update, check active zone temps.
