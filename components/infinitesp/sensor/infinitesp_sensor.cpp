@@ -4,6 +4,13 @@
 namespace esphome {
 namespace infinitesp {
 
+// Physically-plausible band for 061f superheat/subcooling deltas (°C).
+// Typical readings are 0–11 °C; this allows generous margin (~4–5× the real
+// max, plus headroom below zero for transients) while sitting far below the
+// ~1e20 garbage that corrupt 061f fields produce. Anything outside is dropped.
+static constexpr float ODU_DELTA_MIN_C = -40.0f;
+static constexpr float ODU_DELTA_MAX_C = 80.0f;
+
 void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register_key) {
   float value = NAN;
 
@@ -138,10 +145,21 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
       if (idx >= 1 && idx <= 6) {
         float fval = parent_->odu_float_(*data, idx);
         if (!std::isnan(fval)) {
-          if (idx <= 5)
-            value = fval * (5.0f / 9.0f);  // °F delta → °C delta (no -32 offset)
-          else
+          if (idx <= 5) {
+            // 061f floats are °F superheat/subcooling deltas. Some fields
+            // (notably idx 3, subcooling target) decode to absurd ~1e20
+            // magnitudes in certain compressor states — this register's
+            // layout is only partially reverse-engineered (cf. float 6 =
+            // "unk"). Drop physically-impossible readings so the HA sensor
+            // holds its last sane value instead of publishing garbage. No
+            // real refrigerant superheat/subcooling delta lands outside this
+            // band; the corruption is orders of magnitude beyond it.
+            float celsius = fval * (5.0f / 9.0f);  // °F delta → °C delta (no -32 offset)
+            if (celsius >= ODU_DELTA_MIN_C && celsius <= ODU_DELTA_MAX_C)
+              value = celsius;
+          } else {
             value = fval;  // float 6 is dimensionless
+          }
         }
       }
     }
