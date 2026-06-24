@@ -20,17 +20,27 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     if (!data || data->size() < 21)
       return;
 
+    // 0xFF is the "no sensor / not ready" sentinel — the thermostat reports it
+    // for unequipped zones and, transiently, for all sensors during its
+    // post-reboot warmup. Publishing it raw yields garbage (255 °F → 123.9 °C,
+    // 255 %); leave the sensor at its last value (NaN → no publish) instead.
     if (sensor_type_ == "outdoor_temperature") {
-      value = parent_->bus_temp_to_celsius((float) data->at(REG3B02_OUTDOOR_TEMP));
+      uint8_t raw = data->at(REG3B02_OUTDOOR_TEMP);
+      if (raw != 0xFF)
+        value = parent_->bus_temp_to_celsius((float) raw);
     } else if (sensor_type_ == "temperature") {
       uint8_t idx = zone_ - 1;
       if (data->at(REG3B02_ACTIVE_ZONES) & (1 << idx)) {
-        value = parent_->bus_temp_to_celsius((float) data->at(REG3B02_TEMPS + idx));
+        uint8_t raw = data->at(REG3B02_TEMPS + idx);
+        if (raw != 0xFF)
+          value = parent_->bus_temp_to_celsius((float) raw);
       }
     } else if (sensor_type_ == "humidity") {
       uint8_t idx = zone_ - 1;
       if (data->at(REG3B02_ACTIVE_ZONES) & (1 << idx)) {
-        value = (float) data->at(REG3B02_HUMIDITY + idx);
+        uint8_t raw = data->at(REG3B02_HUMIDITY + idx);
+        if (raw != 0xFF)
+          value = (float) raw;
       }
     }
   }
