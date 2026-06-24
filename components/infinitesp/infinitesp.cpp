@@ -498,6 +498,21 @@ void InfinitESPComponent::handle_passive_frame_() {
                  odu_float_(data, 5), odu_float_(data, 6));
       }
 
+      // ODU register 0304: candidate heat/cool direction source. 'ODU Operating
+      // Mode' reads byte 10, but it sits at 0 during cooling, so the real
+      // direction field may be a different byte/bit. Dump the full payload so a
+      // cooling capture (now) can be diffed against a heating capture to locate
+      // the field that flips with direction.
+      if (src_class == 5 && reg_key == REG_ODU_STATUS3) {
+        char hex[32 * 3 + 1] = {};
+        size_t n = data.size() < 32 ? data.size() : 32;
+        for (size_t i = 0; i < n; i++)
+          snprintf(hex + i * 3, 4, "%02X ", data[i]);
+        ESP_LOGD("InfinitESP", "ODU 0304 raw (%u bytes) byte10=%02X: [%s%s]",
+                 (unsigned) data.size(), data.size() >= 11 ? data[10] : 0,
+                 hex, data.size() > 32 ? "..." : "");
+      }
+
       // ODU register 0302: temperatures and thresholds (24 bytes = 12 int16 BE / 16)
       // Alternating (threshold, measurement): offsets 0,4,8,12,16,20 = constants;
       // offsets 2,6,10,14,18,22 = dynamic measurements (accessor idx 0..5).
@@ -592,8 +607,19 @@ void InfinitESPComponent::handle_passive_frame_() {
         current_frame_.payload.size() > 3) {
       std::vector<uint8_t> odu_data(current_frame_.payload.begin() + 3, current_frame_.payload.end());
       store_register_(current_frame_.dst, reg_key, odu_data);
-      if (reg_key == REG_ODU_CMD_STAGE && odu_data.size() >= 4)
+      if (reg_key == REG_ODU_CMD_STAGE && odu_data.size() >= 4) {
         ESP_LOGD("InfinitESP", "ODU 0605 write: commanded_stage=%.1f", (double) odu_commanded_stage_(odu_data));
+      } else {
+        // Any other thermostat→ODU write is a direction-bit candidate (e.g. a
+        // reversing-valve / mode command). Dump key+payload so heat-vs-cool
+        // captures can be diffed to find what carries direction.
+        char hex[24 * 3 + 1] = {};
+        size_t n = odu_data.size() < 24 ? odu_data.size() : 24;
+        for (size_t i = 0; i < n; i++)
+          snprintf(hex + i * 3, 4, "%02X ", odu_data[i]);
+        ESP_LOGD("InfinitESP", "ODU write %04X (%u bytes): [%s%s]", reg_key,
+                 (unsigned) odu_data.size(), hex, odu_data.size() > 24 ? "..." : "");
+      }
       notify_entities_(current_frame_.dst, reg_key);
     }
   }
