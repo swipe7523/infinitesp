@@ -41,6 +41,7 @@ class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
   uint8_t current_action_{0};
   uint8_t last_stage_{0};   // last stage nibble from 3B02 stagmode
   uint8_t last_mode_{0};    // last mode nibble from 3B02 stagmode (direction when stage>0)
+  uint8_t last_odu_dir_{0}; // last ODU 0602 mode nibble (ODU_RUN_COOL/HEAT); 0=unknown
   uint8_t heat_sp_{68};
   uint8_t cool_sp_{76};
   uint8_t fan_mode_{0};

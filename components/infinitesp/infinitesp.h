@@ -175,12 +175,16 @@ static const uint16_t REG_ODU_CYCLES = 0x0310;     // Cycle counters (4-byte key
 static const uint16_t REG_ODU_RUNTIME = 0x0311;    // Runtime hours (4-byte key-value entries)
 //
 // Table 0x06 VAR COMP:
+static const uint16_t REG_ODU_RUN_STATUS = 0x0602;  // byte0 low nibble = operating mode (2=cool, 3=heat); high nibble 0x10 = transient status
 static const uint16_t REG_ODU_COMP_SPEED = 0x0604;  // Compressor speed (uint16 pairs, first = current RPM)
 static const uint16_t REG_ODU_DEMAND = 0x0608;     // Compressor drive: frequency uint16 at [5..6] (0.1 Hz)
 static const uint16_t REG_ODU_CMD_STAGE = 0x0605;  // Commanded compressor stage (float32 at [0..3]: 0.0/1.0..5.0)
 static const uint16_t REG_ODU_STAGE_INFO = 0x060E;  // Actual stage index (byte 0: 0=off, 1..5=stage)
 static const uint16_t REG_ODU_SETPOINT = 0x060B;   // Target value at byte[2], native °F (label TBD; not confirmed a cooling setpoint)
 static const uint16_t REG_ODU_FLOATS = 0x061F;     // IEEE754 float32 array (superheat, subcooling, etc.)
+// REG_ODU_RUN_STATUS (0x0602) byte0 low-nibble values, confirmed by heat-vs-cool bus diff.
+static const uint8_t ODU_RUN_COOL = 2;
+static const uint8_t ODU_RUN_HEAT = 3;
 
 // Frame constants
 static const uint8_t FRAME_HEADER_SIZE = 8;

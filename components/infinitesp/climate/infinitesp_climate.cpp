@@ -188,7 +188,13 @@ bool InfinitESPClimate::compute_action_() {
       case SYSMODE_HEAT:  action = climate::CLIMATE_ACTION_HEATING; break;
       case SYSMODE_COOL:  action = climate::CLIMATE_ACTION_COOLING; break;
       case SYSMODE_EHEAT: action = climate::CLIMATE_ACTION_HEATING; break;
-      default: break;  // AUTO during stage>0: direction unknown (issue #7)
+      default:
+        // AUTO during stage>0: the 3B02 mode nibble stays AUTO on variable-speed
+        // equipment (issue #7), so resolve direction from the ODU's own run-status
+        // register (0602 byte0 low nibble), confirmed by heat-vs-cool bus diff.
+        if (last_odu_dir_ == ODU_RUN_HEAT)      action = climate::CLIMATE_ACTION_HEATING;
+        else if (last_odu_dir_ == ODU_RUN_COOL) action = climate::CLIMATE_ACTION_COOLING;
+        break;
     }
   }
   if (action != current_action_) {
@@ -228,15 +234,10 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
       // requested mode and action is IDLE regardless.
       last_stage_ = stage;
       last_mode_ = mode;
-      // On conventional 2-stage equipment (stage 1-2), the thermostat rewrites
-      // the mode nibble to heat/cool during active operation, so AUTO while
-      // stage>0 is genuinely unexpected - log it. On variable-speed equipment
-      // (stage 3+), the mode nibble can stay AUTO during active operation
-      // (issue #7), so suppress the warning there. compute_action_() handles
-      // the AUTO case independently (falls through to IDLE).
-      if (mode == SYSMODE_AUTO && stage > 0 && stage <= 2) {
-        ESP_LOGW("infinitesp", "Unexpected: stage=%d but mode=AUTO", stage);
-      }
+      // AUTO during stage>0 is normal: variable-speed equipment leaves the 3B02
+      // mode nibble at AUTO during active operation (issue #7). Direction is
+      // resolved independently from the ODU 0602 run-status register, so this
+      // case no longer warrants a warning.
       if (compute_action_())
         changed = true;
 
@@ -278,6 +279,22 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
         else if (this->mode == climate::CLIMATE_MODE_COOL)
           this->target_temperature = cool_c;
         changed = true;
+      }
+    }
+  }
+
+  // ODU run-status (0602): byte0 low nibble carries the true operating direction
+  // (2=cool, 3=heat) even when the 3B02 mode nibble stays AUTO on variable-speed
+  // equipment (issue #7). Cache it so compute_action_() can resolve HEATING/COOLING
+  // during AUTO+stage>0. Delivered with device_addr = ODU address (any class-5 unit).
+  if (register_key == REG_ODU_RUN_STATUS) {
+    auto *data = parent_->get_register(device_addr, REG_ODU_RUN_STATUS);
+    if (data && !data->empty()) {
+      uint8_t dir = data->at(0) & 0x0F;
+      if (dir != last_odu_dir_) {
+        last_odu_dir_ = dir;
+        if (compute_action_())
+          changed = true;
       }
     }
   }

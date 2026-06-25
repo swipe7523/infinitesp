@@ -498,19 +498,15 @@ void InfinitESPComponent::handle_passive_frame_() {
                  odu_float_(data, 5), odu_float_(data, 6));
       }
 
-      // ODU register 0304: candidate heat/cool direction source. 'ODU Operating
-      // Mode' reads byte 10, but it sits at 0 during cooling, so the real
-      // direction field may be a different byte/bit. Dump the full payload so a
-      // cooling capture (now) can be diffed against a heating capture to locate
-      // the field that flips with direction.
-      if (src_class == 5 && reg_key == REG_ODU_STATUS3) {
-        char hex[32 * 3 + 1] = {};
-        size_t n = data.size() < 32 ? data.size() : 32;
-        for (size_t i = 0; i < n; i++)
-          snprintf(hex + i * 3, 4, "%02X ", data[i]);
-        ESP_LOGD("InfinitESP", "ODU 0304 raw (%u bytes) byte10=%02X: [%s%s]",
-                 (unsigned) data.size(), data.size() >= 11 ? data[10] : 0,
-                 hex, data.size() > 32 ? "..." : "");
+      // ODU register 0602: byte0 low nibble is the operating-mode field
+      // (ODU_RUN_COOL=2 / ODU_RUN_HEAT=3), confirmed by heat-vs-cool bus diff.
+      // This is the authoritative direction even when 3B02 mode stays AUTO on
+      // variable-speed equipment (issue #7); the climate component caches it.
+      if (src_class == 5 && reg_key == REG_ODU_RUN_STATUS && data.size() >= 1) {
+        uint8_t dir = data[0] & 0x0F;
+        ESP_LOGD("InfinitESP", "ODU 0602: direction=%s raw_byte0=%02X",
+                 dir == ODU_RUN_HEAT ? "HEAT" : dir == ODU_RUN_COOL ? "COOL" : "idle/unknown",
+                 data[0]);
       }
 
       // ODU register 0302: temperatures and thresholds (24 bytes = 12 int16 BE / 16)
