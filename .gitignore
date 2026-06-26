@@ -10,6 +10,7 @@ __pycache__/
 
 # Dev-only files
 AGENTS.md
+CLAUDE.md
 DEVLOG.md
 .claude/
 private/
