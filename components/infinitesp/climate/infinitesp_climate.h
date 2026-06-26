@@ -23,6 +23,14 @@ static const uint32_t PENDING_SETPOINT_WINDOW_MS = 8000;
 
 class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
  public:
+  InfinitESPClimate() {
+    // Register custom presets on the entity (ClimateTraits::set_supported_custom_presets
+    // was deprecated in 2026.5.0). Climate::get_traits() merges these into traits().
+    static const char *const custom_presets[] = {
+        PRESET_SCHEDULE, PRESET_WAKE, PRESET_HOLD_TIMED, PRESET_HOLD_PERM};
+    this->set_supported_custom_presets(custom_presets);
+  }
+
   void control(const climate::ClimateCall &call) override;
   climate::ClimateTraits traits() override;
   virtual void on_register_update(uint8_t device_addr, uint16_t register_key) override;

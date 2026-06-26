@@ -42,13 +42,10 @@ climate::ClimateTraits InfinitESPClimate::traits() {
   traits.add_supported_preset(climate::CLIMATE_PRESET_AWAY);
   traits.add_supported_preset(climate::CLIMATE_PRESET_SLEEP);
 
-  const char *const custom_presets[] = {
-      PRESET_SCHEDULE,
-      PRESET_WAKE,
-      PRESET_HOLD_TIMED,
-      PRESET_HOLD_PERM,
-  };
-  traits.set_supported_custom_presets(custom_presets);
+  // Custom presets are registered on the entity (in the constructor) rather than
+  // on ClimateTraits — the traits setter was deprecated in 2026.5.0 (removed in
+  // 2026.11.0). Climate::get_traits() merges the entity-owned list into the
+  // returned traits.
 
   return traits;
 }
