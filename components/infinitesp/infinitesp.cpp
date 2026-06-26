@@ -329,11 +329,15 @@ void InfinitESPComponent::parse_byte_(uint8_t byte) {
       if (!resyncing_) {
         diag_crc_fail_++;
         resyncing_ = true;
+        // DEBUG, not WARNING: with byte-drop resync a clipped frame (typically
+        // from RX being muted around our own half-duplex TX) is an expected,
+        // self-healing event. The crc_fail / resync_drops counters in the STATS
+        // line are the health signal; this line is just for deep debugging.
         char hex_buf[64 * 3 + 1] = {};
         for (uint16_t i = 0; i < frame_len && i < 64; i++) {
           snprintf(hex_buf + i * 3, 4, "%02X ", rx_buffer_[i]);
         }
-        ESP_LOGW("InfinitESP", "CRC FAIL seq=%u (%u bytes): [%s%s] -- resyncing",
+        ESP_LOGD("InfinitESP", "CRC FAIL seq=%u (%u bytes): [%s%s] -- resyncing",
                  diag_rx_seq_, (unsigned) frame_len, hex_buf, frame_len > 64 ? "..." : "");
       } else {
         diag_resync_drops_++;
