@@ -139,11 +139,11 @@ void InfinitESPComponent::loop() {
     diag_poll_purged_ += purged;
 
     ESP_LOGI("InfinitESP", "STATS rx_bytes=%u tx_bytes=%u rx_frames=%u tx_frames=%u "
-             "crc_fail=%u stale=%u uart_hwm=%u overflow_evts=%u "
+             "crc_fail=%u resync_drops=%u stale=%u uart_hwm=%u overflow_evts=%u "
              "reply_exp=%u reply_got=%u reply_exc=%u reply_timeout=%u poll_pending=%u "
              "tx_flush_max=%ums loop_max=%ums inter_frame=%u..%ums",
              diag_total_rx_bytes_, diag_total_tx_bytes_, diag_frames_parsed_, diag_tx_seq_,
-             diag_crc_fail_, diag_stale_discard_, diag_uart_hwm_, diag_uart_overflow_events_,
+             diag_crc_fail_, diag_resync_drops_, diag_stale_discard_, diag_uart_hwm_, diag_uart_overflow_events_,
              diag_reply_expected_, diag_reply_received_, diag_reply_exception_, diag_reply_timeout_,
              (uint32_t) pending_polls_.size(),
              diag_tx_flush_max_ms_, diag_loop_max_ms_,
@@ -275,59 +275,96 @@ void InfinitESPComponent::parse_byte_(uint8_t byte) {
              hex_buf, rx_buffer_.size() > 64 ? "..." : "");
     rx_buffer_.clear();
     diag_stale_discard_++;
+    resyncing_ = false;
   }
   last_rx_time_ = now;
 
   rx_buffer_.push_back(byte);
 
-  // Need at least header to determine frame size
-  if (rx_buffer_.size() < FRAME_HEADER_SIZE + FRAME_CRC_SIZE)
-    return;
-
-  uint8_t payload_len = rx_buffer_[4];
-  uint16_t expected_size = FRAME_HEADER_SIZE + payload_len + FRAME_CRC_SIZE;
-
-  if (rx_buffer_.size() < expected_size)
-    return;
-
-  // Full frame received - validate and dispatch
-  diag_rx_seq_++;
-
-  // Track inter-frame timing
-  uint32_t frame_now = millis();
-  if (diag_last_frame_time_ > 0) {
-    uint32_t gap = frame_now - diag_last_frame_time_;
-    if (gap < diag_inter_frame_min_ms_) diag_inter_frame_min_ms_ = gap;
-    if (gap > diag_inter_frame_max_ms_) diag_inter_frame_max_ms_ = gap;
-  }
-  diag_last_frame_time_ = frame_now;
-
-  if (validate_frame_()) {
-    diag_frames_parsed_++;
-    dispatch_frame_();
-  } else {
-    diag_crc_fail_++;
-    char hex_buf[64 * 3 + 1] = {};
-    for (size_t i = 0; i < rx_buffer_.size() && i < 64; i++) {
-      snprintf(hex_buf + i * 3, 4, "%02X ", rx_buffer_[i]);
+  // Extract complete, CRC-valid frames from the front of the buffer. On a CRC
+  // failure, drop a single leading byte and retry rather than clearing the whole
+  // buffer: this re-aligns immediately after a desync (e.g. RX clipped around our
+  // own half-duplex TX) instead of discarding good bytes and waiting for the next
+  // inter-frame gap. Each pass either consumes a full frame or drops one byte, so
+  // the loop is bounded by the buffer size.
+  while (rx_buffer_.size() >= FRAME_MIN_SIZE) {
+    // While resyncing, skip leading bytes until the front looks like a real
+    // frame header. Without this, a misaligned length byte can claim a huge
+    // frame and stall the parser waiting for bytes that never come; the header
+    // check re-anchors on the protocol's invariant fields instead of trusting a
+    // bogus length. Only applied during resync so normal aligned parsing is
+    // unchanged.
+    if (resyncing_ && !front_header_plausible_()) {
+      diag_resync_drops_++;
+      rx_buffer_.erase(rx_buffer_.begin());
+      continue;
     }
-    ESP_LOGW("InfinitESP", "CRC FAIL seq=%u (%d bytes): [%s%s]",
-             diag_rx_seq_, rx_buffer_.size(), hex_buf, rx_buffer_.size() > 64 ? "..." : "");
+
+    uint8_t payload_len = rx_buffer_[4];
+    uint16_t frame_len = FRAME_HEADER_SIZE + payload_len + FRAME_CRC_SIZE;
+    if (rx_buffer_.size() < frame_len)
+      return;  // candidate frame not fully received yet
+
+    if (validate_frame_(frame_len)) {
+      diag_rx_seq_++;
+      diag_frames_parsed_++;
+
+      // Track inter-frame timing
+      uint32_t frame_now = millis();
+      if (diag_last_frame_time_ > 0) {
+        uint32_t gap = frame_now - diag_last_frame_time_;
+        if (gap < diag_inter_frame_min_ms_) diag_inter_frame_min_ms_ = gap;
+        if (gap > diag_inter_frame_max_ms_) diag_inter_frame_max_ms_ = gap;
+      }
+      diag_last_frame_time_ = frame_now;
+
+      resyncing_ = false;
+      dispatch_frame_(frame_len);
+      rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + frame_len);
+    } else {
+      // CRC mismatch — corruption or byte misalignment. Count one failure per
+      // desync episode (not per dropped byte) so the metric stays comparable to
+      // the old whole-buffer-clear behavior; track the realignment cost
+      // separately in diag_resync_drops_. Then drop one leading byte and retry.
+      if (!resyncing_) {
+        diag_crc_fail_++;
+        resyncing_ = true;
+        char hex_buf[64 * 3 + 1] = {};
+        for (uint16_t i = 0; i < frame_len && i < 64; i++) {
+          snprintf(hex_buf + i * 3, 4, "%02X ", rx_buffer_[i]);
+        }
+        ESP_LOGW("InfinitESP", "CRC FAIL seq=%u (%u bytes): [%s%s] -- resyncing",
+                 diag_rx_seq_, (unsigned) frame_len, hex_buf, frame_len > 64 ? "..." : "");
+      } else {
+        diag_resync_drops_++;
+      }
+      rx_buffer_.erase(rx_buffer_.begin());
+    }
   }
-  rx_buffer_.clear();
 }
 
-bool InfinitESPComponent::validate_frame_() {
-  if (rx_buffer_.size() < FRAME_MIN_SIZE)
+bool InfinitESPComponent::front_header_plausible_() const {
+  // A real frame header has invariant fields across all observed bus traffic:
+  // src_bus=0x01, pid=0x00, ext=0x00, and func is one of the known function
+  // codes. (dst_bus varies — 0x01 normally, 0xF1 for broadcasts — so it is not
+  // checked.) Used only to re-anchor during resync.
+  if (rx_buffer_.size() < FRAME_HEADER_SIZE)
+    return false;
+  uint8_t func = rx_buffer_[7];
+  return rx_buffer_[3] == 0x01 && rx_buffer_[5] == 0x00 && rx_buffer_[6] == 0x00 &&
+         (func == FUNC_READ || func == FUNC_REPLY || func == FUNC_WRITE || func == FUNC_EXCEPTION);
+}
+
+bool InfinitESPComponent::validate_frame_(uint16_t frame_len) {
+  if (frame_len < FRAME_MIN_SIZE || rx_buffer_.size() < frame_len)
     return false;
 
-  uint16_t frame_len = rx_buffer_.size();
   uint16_t computed = compute_crc_(rx_buffer_.data(), frame_len - 2);
   uint16_t received = rx_buffer_[frame_len - 2] | (rx_buffer_[frame_len - 1] << 8);
   return computed == received;
 }
 
-void InfinitESPComponent::dispatch_frame_() {
+void InfinitESPComponent::dispatch_frame_(uint16_t frame_len) {
   // Parse frame fields
   current_frame_.dst = rx_buffer_[0];
   current_frame_.dst_bus = rx_buffer_[1];
@@ -338,7 +375,7 @@ void InfinitESPComponent::dispatch_frame_() {
   current_frame_.ext = rx_buffer_[6];
   current_frame_.func = rx_buffer_[7];
   current_frame_.payload.assign(rx_buffer_.begin() + FRAME_HEADER_SIZE,
-                                rx_buffer_.end() - FRAME_CRC_SIZE);
+                                rx_buffer_.begin() + frame_len - FRAME_CRC_SIZE);
 
   // Log parsed frame at INFO level with sequence number
   const char *func_name = "???";

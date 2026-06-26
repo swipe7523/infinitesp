@@ -477,8 +477,11 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
 
  protected:
   void parse_byte_(uint8_t byte);
-  bool validate_frame_();
-  void dispatch_frame_();
+  bool validate_frame_(uint16_t frame_len);
+  // True if the front of rx_buffer_ looks like a real frame header (invariant
+  // fields match). Used to re-anchor the parser during resync.
+  bool front_header_plausible_() const;
+  void dispatch_frame_(uint16_t frame_len);
   void handle_passive_frame_();
   // Classify a device's role (IDU/ODU) from its 0104 nameplate and record its
   // bus address. Called when a 0104 reply is snooped.
@@ -574,7 +577,9 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   uint32_t diag_total_tx_bytes_{0};
   uint32_t diag_frames_parsed_{0};
   uint32_t diag_crc_fail_{0};
+  uint32_t diag_resync_drops_{0};  // leading bytes dropped while re-aligning after a CRC fail
   uint32_t diag_stale_discard_{0};
+  bool resyncing_{false};  // true while dropping bytes to re-align after a CRC fail
   uint32_t diag_last_stats_time_{0};
   bool diag_in_tx_{false};
 
