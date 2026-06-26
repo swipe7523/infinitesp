@@ -194,7 +194,12 @@ void InfinitESPComponent::loop() {
   // The thermostat's own inter-frame gap is 10-30ms, so if 50ms passes
   // with no new frame, the bus is genuinely idle between transactions.
   // This is tighter than the old 200ms byte-gap but still conservative.
-  const uint32_t bus_idle_ms = diag_last_frame_time_ ? (now - diag_last_frame_time_) : 1000;
+  // Gate transmits on time since the last received *byte* (last_rx_time_, updated
+  // per byte) rather than the last *valid frame* (diag_last_frame_time_). A
+  // clipped or CRC-failed frame still means the bus is mid-transaction, so this
+  // keeps us from transmitting into traffic we simply couldn't parse — which
+  // would clip the reply and show up as a poll timeout.
+  const uint32_t bus_idle_ms = last_rx_time_ ? (now - last_rx_time_) : 1000;
 
   // Drain due write retransmit (one per iteration, bus-idle gated). Suppresses
   // the fast/slow polls this iteration to avoid back-to-back TX to the thermostat.
