@@ -284,7 +284,13 @@ void SamAsciiComponent::process_line_(const std::string &line) {
       respond_nak_(prefix, "");
       return;
     }
-    respond_(prefix, format_temp_((*state)[REG3B02_OUTDOOR_TEMP]));
+    // 0xFF = no sensor / not ready (e.g. thermostat warmup); don't report 255°.
+    uint8_t oat = (*state)[REG3B02_OUTDOOR_TEMP];
+    if (oat == 0xFF) {
+      respond_nak_(prefix, "");
+      return;
+    }
+    respond_(prefix, format_temp_(oat));
 
   } else if (body == "DAY") {
     if (!parent_->has_real_state()) {
@@ -326,14 +332,24 @@ void SamAsciiComponent::process_line_(const std::string &line) {
       respond_nak_(prefix, "");
       return;
     }
-    respond_(prefix, format_temp_((*state)[REG3B02_TEMPS + idx]));
+    uint8_t rt = (*state)[REG3B02_TEMPS + idx];
+    if (rt == 0xFF) {  // no sensor / not ready
+      respond_nak_(prefix, "");
+      return;
+    }
+    respond_(prefix, format_temp_(rt));
 
   } else if (body == "RH") {
     if (!state || state->size() <= REG3B02_HUMIDITY + idx) {
       respond_nak_(prefix, "");
       return;
     }
-    respond_(prefix, std::to_string((*state)[REG3B02_HUMIDITY + idx]) + "%");
+    uint8_t rh = (*state)[REG3B02_HUMIDITY + idx];
+    if (rh == 0xFF) {  // no sensor / not ready
+      respond_nak_(prefix, "");
+      return;
+    }
+    respond_(prefix, std::to_string(rh) + "%");
 
   } else if (body == "HTSP") {
     if (!zones_data || zones_data->size() <= REG3B03_HEAT_SETPOINTS + idx) {

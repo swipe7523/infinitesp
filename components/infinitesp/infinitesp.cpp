@@ -138,11 +138,11 @@ void InfinitESPComponent::loop() {
 
     ESP_LOGI("InfinitESP", "STATS rx_bytes=%u tx_bytes=%u rx_frames=%u tx_frames=%u "
              "crc_fail=%u stale=%u uart_hwm=%u overflow_evts=%u "
-             "reply_exp=%u reply_got=%u reply_timeout=%u poll_pending=%u "
+             "reply_exp=%u reply_got=%u reply_exc=%u reply_timeout=%u poll_pending=%u "
              "tx_flush_max=%ums loop_max=%ums inter_frame=%u..%ums",
              diag_total_rx_bytes_, diag_total_tx_bytes_, diag_frames_parsed_, diag_tx_seq_,
              diag_crc_fail_, diag_stale_discard_, diag_uart_hwm_, diag_uart_overflow_events_,
-             diag_reply_expected_, diag_reply_received_, diag_reply_timeout_,
+             diag_reply_expected_, diag_reply_received_, diag_reply_exception_, diag_reply_timeout_,
              (uint32_t) pending_polls_.size(),
              diag_tx_flush_max_ms_, diag_loop_max_ms_,
              diag_inter_frame_min_ms_ == UINT32_MAX ? 0 : diag_inter_frame_min_ms_,
@@ -386,9 +386,18 @@ void InfinitESPComponent::dispatch_frame_() {
     }
   }
 
-  // Reply matching: if this is a REPLY addressed to us, check against pending polls
-  if (current_frame_.func == FUNC_REPLY && to_us) {
-    diag_reply_received_++;
+  // Reply matching: a REPLY *or* EXCEPTION addressed to us closes a pending poll.
+  // The thermostat answers a read it can't serve with an EXCEPTION (0x15) carrying
+  // an error code rather than a REPLY. Matching it here (instead of only REPLY)
+  // erases the pending poll so it doesn't later look like a silent timeout, and
+  // surfaces the rejection with its code.
+  bool is_reply = current_frame_.func == FUNC_REPLY;
+  bool is_exception = current_frame_.func == FUNC_EXCEPTION;
+  if ((is_reply || is_exception) && to_us) {
+    if (is_reply)
+      diag_reply_received_++;
+    else
+      diag_reply_exception_++;
     if (current_frame_.payload.size() >= 3) {
       uint16_t reply_reg = (current_frame_.payload[1] << 8) | current_frame_.payload[2];
       // Find matching pending poll (most recent match)
@@ -396,8 +405,14 @@ void InfinitESPComponent::dispatch_frame_() {
       for (auto it = pending_polls_.rbegin(); it != pending_polls_.rend(); ++it) {
         if (it->dest == current_frame_.src && it->reg_key == reply_reg) {
           uint32_t rtt = millis() - it->sent_ms;
-          ESP_LOGD("InfinitESP", "REPLY MATCHED: rx_seq=%u matched tx_seq=%u dest=%02X reg=%04X rtt=%ums",
-                   diag_rx_seq_, it->tx_seq, it->dest, it->reg_key, rtt);
+          if (is_exception) {
+            uint8_t code = current_frame_.payload.size() >= 4 ? current_frame_.payload[3] : 0;
+            ESP_LOGW("InfinitESP", "POLL EXCEPTION: rx_seq=%u tx_seq=%u dest=%02X reg=%04X code=0x%02X rtt=%ums",
+                     diag_rx_seq_, it->tx_seq, it->dest, it->reg_key, code, rtt);
+          } else {
+            ESP_LOGD("InfinitESP", "REPLY MATCHED: rx_seq=%u matched tx_seq=%u dest=%02X reg=%04X rtt=%ums",
+                     diag_rx_seq_, it->tx_seq, it->dest, it->reg_key, rtt);
+          }
           // Erase by converting reverse iterator to forward iterator
           auto fwd = std::prev(it.base());
           pending_polls_.erase(fwd);
@@ -406,7 +421,8 @@ void InfinitESPComponent::dispatch_frame_() {
         }
       }
       if (!matched) {
-        ESP_LOGW("InfinitESP", "REPLY UNMATCHED: rx_seq=%u from=%02X reg=%04X (pending=%u)",
+        ESP_LOGW("InfinitESP", "%s UNMATCHED: rx_seq=%u from=%02X reg=%04X (pending=%u)",
+                 is_exception ? "EXCEPTION" : "REPLY",
                  diag_rx_seq_, current_frame_.src, reply_reg, (uint32_t) pending_polls_.size());
       }
     }
@@ -444,7 +460,7 @@ void InfinitESPComponent::dispatch_frame_() {
 }
 
 void InfinitESPComponent::handle_passive_frame_() {
-  // Passive snooping: capture REPLY frames from IDU (0x40) and ODU (0x52)
+  // Passive snooping: capture REPLY frames from IDU (0x40) and ODU (0x50)
   // that the thermostat polls. We observe but don't initiate these transactions.
   if (current_frame_.func == FUNC_REPLY && current_frame_.payload.size() > 3) {
     uint8_t src_class = current_frame_.src >> 4;
@@ -981,10 +997,10 @@ const std::vector<uint8_t> *InfinitESPComponent::get_register(uint8_t addr, uint
   return nullptr;
 }
 
-uint8_t InfinitESPComponent::get_zone_count() const {
+uint8_t InfinitESPComponent::get_active_zones_mask() const {
   auto *state = get_register(sam_address_, REG_SAM_STATE);
   if (state && !state->empty())
-    return state->at(0);  // active_zones bitmask
+    return state->at(REG3B02_ACTIVE_ZONES);  // bit N = zone N+1 active
   return 0;
 }
 

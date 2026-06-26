@@ -315,7 +315,8 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   void set_zc_staleness_timeout(uint8_t zone, uint32_t timeout_ms);
 
   const std::vector<uint8_t> *get_register(uint8_t addr, uint16_t key) const;
-  uint8_t get_zone_count() const;
+  // Returns the 3B02 active-zones bitmask (bit N = zone N+1 active), NOT a count.
+  uint8_t get_active_zones_mask() const;
   bool is_bus_online() const { return bus_online_; }
   bool has_real_state() const { return sam_state_received_; }
 
@@ -382,7 +383,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   static float decode_int16_f_(const std::vector<uint8_t> &data, size_t offset) {
     if (offset + 2 > data.size())
       return NAN;
-    int16_t raw = (int16_t) ((uint16_t) data[offset] << 8) | data[offset + 1];
+    int16_t raw = (int16_t) (((uint16_t) data[offset] << 8) | data[offset + 1]);
     return (float) raw / 16.0f;
   }
 
@@ -565,6 +566,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   uint32_t diag_uart_overflow_events_{0};  // times available() > 75% of rx_buffer_size
   uint32_t diag_reply_expected_{0};   // total REPLY frames we expected (matched to our READs)
   uint32_t diag_reply_received_{0};   // total REPLY frames we actually received
+  uint32_t diag_reply_exception_{0};  // EXCEPTION frames received in answer to our polls
   uint32_t diag_reply_timeout_{0};    // polls that timed out without a reply
   uint32_t diag_tx_flush_max_ms_{0};  // max time spent in flush()
   uint32_t diag_loop_max_ms_{0};      // max time spent in a single loop() iteration

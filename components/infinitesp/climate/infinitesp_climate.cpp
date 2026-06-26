@@ -216,12 +216,18 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
       if (!(active & (1 << idx)))
         return;
 
-      float temp_bus = (float)data->at(REG3B02_TEMPS + idx);
-      float temp = parent_->bus_temp_to_celsius(temp_bus);
-      if (temp != current_temp_) {
-        current_temp_ = temp;
-        this->current_temperature = temp;
-        changed = true;
+      // 0xFF is the "no sensor / not ready" sentinel (reported transiently for
+      // all zones during the thermostat's post-reboot warmup). Decoding it raw
+      // yields ~124°C; skip the update and hold the last value, matching the
+      // sensor platform's handling of the same 3B02 fields.
+      uint8_t temp_raw = data->at(REG3B02_TEMPS + idx);
+      if (temp_raw != 0xFF) {
+        float temp = parent_->bus_temp_to_celsius((float) temp_raw);
+        if (temp != current_temp_) {
+          current_temp_ = temp;
+          this->current_temperature = temp;
+          changed = true;
+        }
       }
 
       uint8_t stagmode = data->at(REG3B02_STAGMODE);
@@ -319,10 +325,7 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
         if (new_cool != pending_cool_)
           new_cool = pending_cool_;
       } else {
-        pending_active_ = false;  // window expired or thermostat confirmed
-        // If thermostat adopted our values, clear pending naturally
-        if (pending_active_ && new_heat == pending_heat_ && new_cool == pending_cool_)
-          pending_active_ = false;
+        pending_active_ = false;  // window expired
       }
 
       // Track whether cached setpoints changed (for publish gating)
