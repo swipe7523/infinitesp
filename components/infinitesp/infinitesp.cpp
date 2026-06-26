@@ -1,5 +1,7 @@
 #include "infinitesp.h"
 #include "esphome/components/sensor/sensor.h"
+#include <cctype>
+#include <string>
 
 namespace esphome {
 namespace infinitesp {
@@ -459,55 +461,106 @@ void InfinitESPComponent::dispatch_frame_() {
   }
 }
 
-void InfinitESPComponent::handle_passive_frame_() {
-  // Passive snooping: capture REPLY frames from IDU (0x40) and ODU (0x50)
-  // that the thermostat polls. We observe but don't initiate these transactions.
-  if (current_frame_.func == FUNC_REPLY && current_frame_.payload.size() > 3) {
-    uint8_t src_class = current_frame_.src >> 4;
-    // Class 4 = Indoor Unit, Class 5 = Outdoor Unit
-    if (src_class == 4 || src_class == 5) {
-      uint8_t table = current_frame_.payload[1];
-      uint8_t row = current_frame_.payload[2];
-      uint16_t reg_key = (table << 8) | row;
-      std::vector<uint8_t> data(current_frame_.payload.begin() + 3, current_frame_.payload.end());
-      store_register_(current_frame_.src, reg_key, data);
+void InfinitESPComponent::learn_device_(uint8_t addr, const std::vector<uint8_t> &info) {
+  // The 0104 reply is the device nameplate: an ASCII description followed by
+  // model/serial. Classify the device's role from keywords in that text. This is
+  // the protocol's own identity mechanism — the thermostat reads 0104 from every
+  // address during its boot-time enrollment scan (source 0x1F) and re-reads it
+  // in steady state — so it works regardless of which bus address the equipment
+  // happens to occupy.
+  std::string name;
+  for (uint8_t b : info)
+    name += (b >= 0x20 && b < 0x7F) ? (char) std::toupper(b) : ' ';
+  auto has = [&](const char *kw) { return name.find(kw) != std::string::npos; };
 
-      // Log decoded IDU data via accessors (single source of truth for offsets)
-      if (src_class == 4 && reg_key == REG_IDU_STATUS) {
-        float blower_rpm = idu_blower_rpm_(data);
-        if (!std::isnan(blower_rpm))
-          ESP_LOGD("InfinitESP", "IDU 0306: blower_rpm=%u", (unsigned) blower_rpm);
+  // Indoor unit: gas/oil furnace, air handler, or fan coil.
+  bool indoor = has("FURNACE") || has("AIR HANDLER") || has("FAN COIL") ||
+                has("FANCOIL") || has("AIR HND");
+  // Outdoor unit: compressor / heat pump / condenser. Guard with !indoor so a
+  // nameplate mentioning both (unlikely) is treated as the indoor unit.
+  bool outdoor = !indoor && (has("COMP") || has("HEAT PUMP") ||
+                             has("CONDENS") || has("OUTDOOR"));
+
+  if (indoor && !idu_address_locked_ && idu_address_ != addr) {
+    ESP_LOGI("InfinitESP", "Discovered IDU at %02X (prev %02X) from nameplate", addr, idu_address_);
+    idu_address_ = addr;
+  }
+  if (outdoor && !odu_address_locked_ && odu_address_ != addr) {
+    ESP_LOGI("InfinitESP", "Discovered ODU at %02X (prev %02X) from nameplate", addr, odu_address_);
+    odu_address_ = addr;
+  }
+}
+
+void InfinitESPComponent::handle_passive_frame_() {
+  // Passive snooping: capture REPLY frames from the indoor unit (IDU) and
+  // outdoor unit (ODU) that the thermostat polls. We observe but don't initiate
+  // these transactions.
+  if (current_frame_.func == FUNC_REPLY && current_frame_.payload.size() > 3) {
+    uint8_t src = current_frame_.src;
+    uint8_t src_class = src >> 4;
+    uint16_t reg_key = (current_frame_.payload[1] << 8) | current_frame_.payload[2];
+    std::vector<uint8_t> data(current_frame_.payload.begin() + 3, current_frame_.payload.end());
+
+    // Protocol-native device discovery: learn IDU/ODU addresses from the 0104
+    // nameplate instead of assuming the address-nibble convention holds.
+    if (reg_key == REG_DEVICE_INFO)
+      learn_device_(src, data);
+
+    bool is_idu = is_idu_addr(src);
+    bool is_odu = is_odu_addr(src);
+
+    if (is_idu) {
+      // The IDU shares register *numbers* with the ODU (0302/0304/0310/0311) and
+      // notify_entities_ fans out by register number, not role — so capturing the
+      // furnace's 0302/0304 here would feed it to ODU temperature sensors.
+      // Restrict capture to registers an IDU sensor actually reads; the shared
+      // cycle/runtime counters (0310/0311) are disambiguated downstream by
+      // is_idu_addr()/is_odu_addr() in the sensor.
+      if (reg_key == REG_IDU_STATUS || reg_key == REG_IDU_CONFIG ||
+          reg_key == REG_IDU_CYCLES || reg_key == REG_IDU_RUNTIME) {
+        store_register_(src, reg_key, data);
+
+        // Log decoded IDU data via accessors (single source of truth for offsets)
+        if (reg_key == REG_IDU_STATUS) {
+          float blower_rpm = idu_blower_rpm_(data);
+          if (!std::isnan(blower_rpm))
+            ESP_LOGD("InfinitESP", "IDU 0306: blower_rpm=%u", (unsigned) blower_rpm);
+        }
+        if (reg_key == REG_IDU_CONFIG) {
+          float airflow_cfm = idu_airflow_cfm_(data);
+          if (!std::isnan(airflow_cfm))
+            ESP_LOGD("InfinitESP", "IDU 0316: airflow_cfm=%u elec_heat=%d",
+                     (unsigned) airflow_cfm, (int) idu_electric_heat_(data));
+        }
+
+        notify_entities_(src, reg_key);
       }
-      if (src_class == 4 && reg_key == REG_IDU_CONFIG) {
-        float airflow_cfm = idu_airflow_cfm_(data);
-        if (!std::isnan(airflow_cfm))
-          ESP_LOGD("InfinitESP", "IDU 0316: airflow_cfm=%u elec_heat=%d",
-                   (unsigned) airflow_cfm, (int) idu_electric_heat_(data));
-      }
+    } else if (is_odu) {
+      store_register_(src, reg_key, data);
 
       // Log decoded ODU data
-      if (src_class == 5 && reg_key == REG_ODU_STATUS2 && data.size() >= 1) {
+      if (reg_key == REG_ODU_STATUS2 && data.size() >= 1) {
         ESP_LOGD("InfinitESP", "ODU 0303: stage=%u raw=[%02X %02X %02X %02X]",
                  data[0] >> 1, data[0], data.size() > 1 ? data[1] : 0,
                  data.size() > 2 ? data[2] : 0, data.size() > 3 ? data[3] : 0);
       }
-      if (src_class == 5 && reg_key == REG_ODU_COMP_SPEED) {
+      if (reg_key == REG_ODU_COMP_SPEED) {
         float comp_rpm = odu_compressor_rpm_(data);
         if (!std::isnan(comp_rpm))
           ESP_LOGD("InfinitESP", "ODU 0604: compressor_rpm=%u (%u bytes)",
                    (unsigned) comp_rpm, data.size());
       }
-      if (src_class == 5 && reg_key == REG_ODU_DEMAND && data.size() >= 7) {
+      if (reg_key == REG_ODU_DEMAND && data.size() >= 7) {
         ESP_LOGD("InfinitESP", "ODU 0608: compressor_frequency=%.1f Hz raw=[%02X %02X %02X %02X %02X %02X %02X]",
                  odu_compressor_frequency_(data),
                  data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
       }
-      if (src_class == 5 && reg_key == REG_ODU_STAGE_INFO && data.size() >= 1) {
+      if (reg_key == REG_ODU_STAGE_INFO && data.size() >= 1) {
         ESP_LOGD("InfinitESP", "ODU 060e: stage=%u raw=[%02X]",
                  (unsigned) odu_stage_(data), data[0]);
       }
 
-      if (src_class == 5 && reg_key == REG_ODU_FLOATS && data.size() >= 25) {
+      if (reg_key == REG_ODU_FLOATS && data.size() >= 25) {
         ESP_LOGI("InfinitESP", "ODU 061f: sh_tgt=%.1f sh_act=%.1f sc_tgt=%.1f sc_act=%.1f dyn=%.1f unk=%.3f",
                  odu_float_(data, 1), odu_float_(data, 2),
                  odu_float_(data, 3), odu_float_(data, 4),
@@ -518,7 +571,7 @@ void InfinitESPComponent::handle_passive_frame_() {
       // (ODU_RUN_COOL=2 / ODU_RUN_HEAT=3), confirmed by heat-vs-cool bus diff.
       // This is the authoritative direction even when 3B02 mode stays AUTO on
       // variable-speed equipment (issue #7); the climate component caches it.
-      if (src_class == 5 && reg_key == REG_ODU_RUN_STATUS && data.size() >= 1) {
+      if (reg_key == REG_ODU_RUN_STATUS && data.size() >= 1) {
         uint8_t dir = data[0] & 0x0F;
         ESP_LOGD("InfinitESP", "ODU 0602: direction=%s raw_byte0=%02X",
                  dir == ODU_RUN_HEAT ? "HEAT" : dir == ODU_RUN_COOL ? "COOL" : "idle/unknown",
@@ -528,14 +581,14 @@ void InfinitESPComponent::handle_passive_frame_() {
       // ODU register 0302: temperatures and thresholds (24 bytes = 12 int16 BE / 16)
       // Alternating (threshold, measurement): offsets 0,4,8,12,16,20 = constants;
       // offsets 2,6,10,14,18,22 = dynamic measurements (accessor idx 0..5).
-      if (src_class == 5 && reg_key == REG_ODU_STATUS1 && data.size() >= 24) {
+      if (reg_key == REG_ODU_STATUS1 && data.size() >= 24) {
         ESP_LOGD("InfinitESP", "ODU 0302: outdoor=%.1f coil=%.1f suction=%.1f liquid=%.1f indoor_amb=%.1f discharge=%.1f",
                  odu_status1_meas_f_(data, 0), odu_status1_meas_f_(data, 1),
                  odu_status1_meas_f_(data, 2), odu_status1_meas_f_(data, 3),
                  odu_status1_meas_f_(data, 4), odu_status1_meas_f_(data, 5));
       }
 
-      notify_entities_(current_frame_.src, reg_key);
+      notify_entities_(src, reg_key);
     }
 
     // Zone Controller (class 6, 0x60) replies — e.g. zone status (0302).
@@ -612,10 +665,11 @@ void InfinitESPComponent::handle_passive_frame_() {
 
     // Capture thermostat→ODU writes. The ODU never replies to these (write-only
     // registers like 060b setpoint and 0605 commanded stage), so passive write
-    // capture is the only source. Stored under dst (ODU address) so ODU sensors
-    // match on bus_class 5. Write rows (0x0605/060b/0610/0612/061a/061d/061e)
-    // do not collide with reply rows (0x0602/0604/0608/060a/060e/061f/0625).
-    if (current_frame_.dst >> 4 == 5 && current_frame_.src == ADDR_THERMOSTAT &&
+    // capture is the only source. Stored under dst (the ODU address) so ODU
+    // sensors read it back via notify. Write rows (0x0605/060b/0610/0612/061a/
+    // 061d/061e) do not collide with reply rows (0x0602/0604/0608/060a/060e/
+    // 061f/0625).
+    if (is_odu_addr(current_frame_.dst) && current_frame_.src == ADDR_THERMOSTAT &&
         current_frame_.payload.size() > 3) {
       std::vector<uint8_t> odu_data(current_frame_.payload.begin() + 3, current_frame_.payload.end());
       store_register_(current_frame_.dst, reg_key, odu_data);
@@ -978,7 +1032,18 @@ void InfinitESPComponent::store_register_(uint8_t addr, uint16_t key, const std:
 }
 
 void InfinitESPComponent::notify_entities_(uint8_t device_addr, uint16_t register_key) {
-  uint8_t src_class = device_addr >> 4;
+  // Entities filter by logical device class (4=IDU, 5=ODU, 6=ZC; 0=any). Map the
+  // bus address to that class via the learned IDU/ODU addresses so equipment that
+  // doesn't follow the address-nibble convention (e.g. a furnace at 0x3E, which
+  // is class 3) still reaches its class-4 entities. Fall back to the address
+  // nibble until discovery has identified the device.
+  uint8_t src_class;
+  if (idu_address_ != 0 && device_addr == idu_address_)
+    src_class = 4;
+  else if (odu_address_ != 0 && device_addr == odu_address_)
+    src_class = 5;
+  else
+    src_class = device_addr >> 4;
   for (auto *entity : entities_) {
     uint8_t dc = entity->get_bus_class();
     if (dc != 0 && src_class != 0 && dc != src_class)

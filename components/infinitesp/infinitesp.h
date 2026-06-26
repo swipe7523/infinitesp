@@ -255,6 +255,20 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   void set_zc_address(uint8_t addr) { zc_address_ = addr; }
   uint8_t get_zc_address() const { return zc_address_; }
   bool zc_enabled() const { return zc_address_ != 0; }
+
+  // Indoor/outdoor unit bus addresses. 0 = not yet discovered: the component
+  // learns them from each device's nameplate (register 0104) snooped on the bus
+  // (see learn_device_), because the address varies by equipment — the furnace
+  // is 0x3E on some systems, not the 0x40 the address-nibble convention assumes.
+  // A nonzero value set from YAML is a manual override that locks out discovery.
+  void set_indoor_unit_address(uint8_t addr) { idu_address_ = addr; idu_address_locked_ = (addr != 0); }
+  void set_outdoor_unit_address(uint8_t addr) { odu_address_ = addr; odu_address_locked_ = (addr != 0); }
+  // Role test for a source address. Falls back to the historical address-nibble
+  // convention (class 4 = IDU, class 5 = ODU) until discovery has run. Used both
+  // by the passive snooper and by sensors to disambiguate shared register
+  // numbers (0310/0311 cycle/runtime counters exist on both the IDU and ODU).
+  bool is_idu_addr(uint8_t addr) const { return idu_address_ != 0 ? addr == idu_address_ : (addr >> 4) == 4; }
+  bool is_odu_addr(uint8_t addr) const { return odu_address_ != 0 ? addr == odu_address_ : (addr >> 4) == 5; }
 // True if this zone's damper is open (zone is receiving conditioned air).
   // Consults register 0308 under the ZC address: our emulated ZC (zc_address_)
   // when emulating, or the standard 0x60 when passively snooping a real
@@ -466,6 +480,9 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   bool validate_frame_();
   void dispatch_frame_();
   void handle_passive_frame_();
+  // Classify a device's role (IDU/ODU) from its 0104 nameplate and record its
+  // bus address. Called when a 0104 reply is snooped.
+  void learn_device_(uint8_t addr, const std::vector<uint8_t> &info);
 
   void transmit_frame_(uint8_t dst, uint8_t dst_bus, uint8_t src, uint8_t src_bus, uint8_t func,
                        const std::vector<uint8_t> &payload);
@@ -537,6 +554,10 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   std::vector<InfinitESPEntity *> entities_;
   uint8_t sam_address_{ADDR_FAKESAM};
   uint8_t zc_address_{0};  // 0 = zone controller emulation disabled
+  uint8_t idu_address_{0};  // indoor unit; 0 = not yet discovered (nibble fallback)
+  uint8_t odu_address_{0};  // outdoor unit; 0 = not yet discovered (nibble fallback)
+  bool idu_address_locked_{false};  // true = set from YAML, skip auto-discovery
+  bool odu_address_locked_{false};
   ZCZoneConfig zc_zones_[5];  // index 0=unused, 1-4=zones (only 2-4 have sensors)
   uint32_t last_zc_sensor_check_{0};
   uint32_t last_rx_time_{0};

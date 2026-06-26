@@ -24,6 +24,8 @@ CONF_SAM_ADDRESS = "sam_address"
 CONF_ADDRESS = "address"  # deprecated alias for sam_address
 CONF_FLOW_CONTROL_PIN = "flow_control_pin"
 CONF_ZONE_CONTROLLER_ADDRESS = "zone_controller_address"
+CONF_INDOOR_UNIT_ADDRESS = "indoor_unit_address"
+CONF_OUTDOOR_UNIT_ADDRESS = "outdoor_unit_address"
 CONF_TEMPERATURE_UNIT = "temperature_unit"
 
 # ZC zone sensor reference configuration
@@ -98,6 +100,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
             # Zone controller emulation: set to 0x60 to emulate a SYSTXCC4ZC01
             cv.Optional(CONF_ZONE_CONTROLLER_ADDRESS, default=0): cv.int_range(min=0, max=255),
+            # Indoor/outdoor unit bus addresses. Normally auto-discovered from the
+            # device nameplate (register 0104); set these only to override a wrong
+            # or ambiguous auto-detection (e.g. unusual equipment naming).
+            cv.Optional(CONF_INDOOR_UNIT_ADDRESS): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_OUTDOOR_UNIT_ADDRESS): cv.int_range(min=0, max=255),
             # Temperature unit: auto (heuristic), F, or C
             cv.Optional(CONF_TEMPERATURE_UNIT, default=TEMP_UNIT_AUTO): cv.one_of(TEMP_UNIT_AUTO, TEMP_UNIT_FAHRENHEIT, TEMP_UNIT_CELSIUS, lower=True),
             # ZC zone temperature sensor references (requires zone_controller_address)
@@ -130,6 +137,12 @@ async def to_code(config):
 
     if config[CONF_ZONE_CONTROLLER_ADDRESS] != 0:
         cg.add(var.set_zc_address(config[CONF_ZONE_CONTROLLER_ADDRESS]))
+
+    # Manual IDU/ODU address overrides (auto-discovered from 0104 otherwise)
+    if CONF_INDOOR_UNIT_ADDRESS in config:
+        cg.add(var.set_indoor_unit_address(config[CONF_INDOOR_UNIT_ADDRESS]))
+    if CONF_OUTDOOR_UNIT_ADDRESS in config:
+        cg.add(var.set_outdoor_unit_address(config[CONF_OUTDOOR_UNIT_ADDRESS]))
 
     # Wire up ZC zone temperature sensor references
     for zone_num, zone_key in [(2, CONF_ZC_ZONE_2), (3, CONF_ZC_ZONE_3), (4, CONF_ZC_ZONE_4)]:

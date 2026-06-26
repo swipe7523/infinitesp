@@ -272,15 +272,24 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
 
     for (const auto &km : kv_map) {
       if (sensor_type_ == km.suffix) {
-        auto *data = parent_->get_register(device_addr, km.reg);
-        if (data && data->size() >= 4) {
-          for (size_t i = 0; i + 3 < data->size(); i += 4) {
-            if ((*data)[i] == km.key) {
-              uint32_t val = ((uint32_t)(*data)[i+1] << 16) |
-                             ((uint32_t)(*data)[i+2] << 8) |
-                             (uint32_t)(*data)[i+3];
-              value = (float) val;
-              break;
+        // 0310/0311 are shared register numbers: both the IDU and ODU publish
+        // cycle/runtime counters under them, and some byte-keys collide (0x23
+        // heat, 0x2B poweron). notify_entities_ fans out by register number, so
+        // gate on device role to consume only the matching unit's counters.
+        bool role_ok = (sensor_type_.rfind("idu_", 0) == 0)
+                           ? parent_->is_idu_addr(device_addr)
+                           : parent_->is_odu_addr(device_addr);
+        if (role_ok) {
+          auto *data = parent_->get_register(device_addr, km.reg);
+          if (data && data->size() >= 4) {
+            for (size_t i = 0; i + 3 < data->size(); i += 4) {
+              if ((*data)[i] == km.key) {
+                uint32_t val = ((uint32_t)(*data)[i+1] << 16) |
+                               ((uint32_t)(*data)[i+2] << 8) |
+                               (uint32_t)(*data)[i+3];
+                value = (float) val;
+                break;
+              }
             }
           }
         }
