@@ -26,7 +26,12 @@ SENSOR_TYPES = {
     "odu_mode": {"key": "odu_operating_mode", "unit": "", "bus_class": 5},
     # ODU line voltage from register 0304 byte 7 (whole volts, state-independent)
     "odu_line_voltage": {"key": "odu_line_voltage", "unit": "V", "device_class": DEVICE_CLASS_VOLTAGE, "bus_class": 5},
-    # ODU IEEE754 float32 values from register 061f
+    # ODU outdoor fan RPM from register 060a data[64] (confirmed vs Anantha MQTT)
+    "odu_fan_rpm": {"key": "odu_fan_rpm", "unit": "RPM", "bus_class": 5},
+    # ODU live suction superheat from register 0613 data[52] float32 (\u00b0F\u2192\u00b0C delta).
+    # The correct live value; 061f idx2 below is a STATIC target, kept for reference.
+    "odu_suction_superheat": {"key": "odu_suction_superheat", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    # ODU IEEE754 float32 values from register 061f \u2014 STATIC targets, not live measurements
     "odu_float_1": {"key": "odu_float_1", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_float_2": {"key": "odu_float_2", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_float_3": {"key": "odu_float_3", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},

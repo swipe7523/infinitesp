@@ -634,6 +634,21 @@ void InfinitESPComponent::handle_passive_frame_() {
                  odu_status1_meas_f_(data, 4), odu_status1_meas_f_(data, 5));
       }
 
+      // Outdoor fan RPM (060A data[64]) and live suction superheat (0613 data[52]),
+      // both reverse-engineered against Anantha MQTT ground truth.
+      if (reg_key == REG_ODU_FAN) {
+        float rpm = odu_outdoor_fan_rpm_(data);
+        if (!std::isnan(rpm))
+          ESP_LOGD("InfinitESP", "ODU 060a: outdoor_fan_rpm=%u (%u bytes)",
+                   (unsigned) rpm, data.size());
+      }
+      if (reg_key == REG_ODU_SUPERHEAT) {
+        float sh = odu_suction_superheat_f_(data);
+        if (!std::isnan(sh))
+          ESP_LOGD("InfinitESP", "ODU 0613: suction_superheat=%.1f °F (%u bytes)",
+                   sh, data.size());
+      }
+
       notify_entities_(src, reg_key);
     }
 

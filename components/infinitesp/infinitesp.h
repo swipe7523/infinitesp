@@ -181,7 +181,9 @@ static const uint16_t REG_ODU_DEMAND = 0x0608;     // Compressor drive: frequenc
 static const uint16_t REG_ODU_CMD_STAGE = 0x0605;  // Commanded compressor stage (float32 at [0..3]: 0.0/1.0..5.0)
 static const uint16_t REG_ODU_STAGE_INFO = 0x060E;  // Actual stage index (byte 0: 0=off, 1..5=stage)
 static const uint16_t REG_ODU_SETPOINT = 0x060B;   // Target value at byte[2], native °F (label TBD; not confirmed a cooling setpoint)
-static const uint16_t REG_ODU_FLOATS = 0x061F;     // IEEE754 float32 array (superheat, subcooling, etc.)
+static const uint16_t REG_ODU_FLOATS = 0x061F;     // IEEE754 float32 array — STATIC superheat/subcooling TARGETS (not live)
+static const uint16_t REG_ODU_FAN = 0x060A;        // Outdoor fan: current RPM u16 BE at data[64]
+static const uint16_t REG_ODU_SUPERHEAT = 0x0613;  // Live refrigerant floats: suction superheat f32 BE at data[52]
 // REG_ODU_RUN_STATUS (0x0602) byte0 low-nibble values, confirmed by heat-vs-cool bus diff.
 static const uint8_t ODU_RUN_COOL = 2;
 static const uint8_t ODU_RUN_HEAT = 3;
@@ -469,10 +471,38 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     return decode_f32_be_(data, 1 + (idx - 1) * 4);
   }
   // ODU register 0302 (REG_ODU_STATUS1): measurement slot idx 0..5 at offset 2+idx*4.
-  //   idx 0=outdoor 1=coil 2=suction 3=subcooling(ΔT) 4=indoor_amb 5=discharge
-  // Native °F via decode_int16_f_. idx 3 is a delta (caller skips the -32).
+  //   idx 0=outdoor 1=coil 2=suction 5=discharge are real °F temps (confirmed vs
+  //   Anantha MQTT ground truth). idx 3/4 are NOT subcooling/indoor-ambient — those
+  //   offsets decode to non-temperature data (~329°F/348°F); see odu_status1_temp_f_.
+  // Native °F via decode_int16_f_. (idx 3 was historically treated as a ΔT delta.)
   static float odu_status1_meas_f_(const std::vector<uint8_t> &data, uint8_t idx) {
     return decode_int16_f_(data, 2 + idx * 4);
+  }
+  // Plausibility-guarded ODU 0302 temp read: returns NAN for the known-bad idx 3/4
+  // slots and for any slot that decodes outside a physical outdoor-equipment band,
+  // so HA holds last-sane instead of publishing garbage. Per the repo convention of
+  // rejecting bad reverse-engineered data rather than publishing it.
+  static float odu_status1_temp_f_(const std::vector<uint8_t> &data, uint8_t idx) {
+    float f = odu_status1_meas_f_(data, idx);
+    if (std::isnan(f) || f < -40.0f || f > 200.0f)  // °F band for coil/suction/discharge/outdoor
+      return NAN;
+    return f;
+  }
+  // ODU register 060A (REG_ODU_FAN): outdoor fan current RPM, u16 BE at data[64].
+  // Confirmed by state-tracking vs Anantha outdoor_fan_rpm (385→400 tracked 380→405).
+  static float odu_outdoor_fan_rpm_(const std::vector<uint8_t> &data) {
+    if (data.size() < 66) return NAN;
+    return (float) (((uint16_t) data[64] << 8) | data[65]);
+  }
+  // ODU register 0613 (REG_ODU_SUPERHEAT): LIVE suction superheat, float32 BE at
+  // data[52], native °F delta. Confirmed vs Anantha suction_superheat (20.41→21.63
+  // tracked 20.33→21.43). Supersedes the 061F idx2 "superheat actual", which is a
+  // static target that never tracks the real measurement. Caller converts °F→°C.
+  static float odu_suction_superheat_f_(const std::vector<uint8_t> &data) {
+    float f = decode_f32_be_(data, 52);
+    if (std::isnan(f) || f < -5.0f || f > 80.0f)  // °F superheat plausibility band
+      return NAN;
+    return f;
   }
 
  protected:

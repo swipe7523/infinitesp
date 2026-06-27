@@ -199,18 +199,43 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
       if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
     }
   }
+  // 0302 idx 3/4 do NOT carry subcooling / indoor-ambient: cross-referenced against
+  // Anantha MQTT, these offsets decode to ~329°F/348°F (non-temperature data) and
+  // were publishing ~182°C/175°C to HA. odu_status1_temp_f_ band-rejects them → NAN
+  // → no publish, until the correct offsets are reverse-engineered. (issue: 0302 is
+  // not a clean 6-slot temp array; only idx 0/1/2/5 are temps.)
   if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_subcooling_degf_int") {
     auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
     if (data) {
-      float f = parent_->odu_status1_meas_f_(*data, 3);  // delta °F
+      float f = parent_->odu_status1_temp_f_(*data, 3);
       if (!std::isnan(f)) value = f * (5.0f / 9.0f);  // delta °F → delta °C
     }
   }
   if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_indoor_ambient") {
     auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
     if (data) {
-      float f = parent_->odu_status1_meas_f_(*data, 4);
+      float f = parent_->odu_status1_temp_f_(*data, 4);
       if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
+    }
+  }
+
+  // Outdoor fan RPM from ODU register 060A data[64] (u16 BE). Confirmed vs Anantha.
+  if (register_key == REG_ODU_FAN && sensor_type_ == "odu_fan_rpm") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
+    if (data) {
+      float rpm = parent_->odu_outdoor_fan_rpm_(*data);
+      if (!std::isnan(rpm))
+        value = rpm;
+    }
+  }
+
+  // Live suction superheat from ODU register 0613 data[52] (float32 BE, °F delta).
+  // Supersedes the static 061F idx2 target. Convert °F delta → °C delta (no -32).
+  if (register_key == REG_ODU_SUPERHEAT && sensor_type_ == "odu_suction_superheat") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_SUPERHEAT);
+    if (data) {
+      float f = parent_->odu_suction_superheat_f_(*data);
+      if (!std::isnan(f)) value = f * (5.0f / 9.0f);
     }
   }
   if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_discharge_temp") {
