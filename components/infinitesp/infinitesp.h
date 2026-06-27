@@ -504,6 +504,22 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
       return NAN;
     return f;
   }
+  // ODU register 0303 (REG_ODU_STATUS2): refrigerant pressures, u16 BE / 16 (psig).
+  //   data[2] = suction pressure, data[6] = discharge pressure.
+  // Confirmed across an OFF->HIGH compressor transition vs Anantha MQTT: suction
+  // moved COUNTER to the load ramp (133->95 psig) — ruling out collinear coincidence
+  // — and discharge matched to <1 psi (184->211). (The register's "4 bytes" label
+  // is stale; replies carry >= 8 data bytes.)
+  static float odu_suction_pressure_psig_(const std::vector<uint8_t> &data) {
+    if (data.size() < 4) return NAN;
+    float p = (float) (((uint16_t) data[2] << 8) | data[3]) / 16.0f;
+    return (p >= 0.0f && p <= 700.0f) ? p : NAN;  // refrigerant pressure plausibility
+  }
+  static float odu_discharge_pressure_psig_(const std::vector<uint8_t> &data) {
+    if (data.size() < 8) return NAN;
+    float p = (float) (((uint16_t) data[6] << 8) | data[7]) / 16.0f;
+    return (p >= 0.0f && p <= 700.0f) ? p : NAN;
+  }
 
  protected:
   void parse_byte_(uint8_t byte);

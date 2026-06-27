@@ -238,6 +238,23 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
       if (!std::isnan(f)) value = f * (5.0f / 9.0f);
     }
   }
+
+  // Refrigerant pressures from ODU register 0303 (u16 BE /16, psig). Confirmed
+  // across an OFF→HIGH transition vs Anantha (suction counter-trended the ramp).
+  if (register_key == REG_ODU_STATUS2 && sensor_type_ == "odu_suction_pressure") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS2);
+    if (data) {
+      float p = parent_->odu_suction_pressure_psig_(*data);
+      if (!std::isnan(p)) value = p;
+    }
+  }
+  if (register_key == REG_ODU_STATUS2 && sensor_type_ == "odu_discharge_pressure") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS2);
+    if (data) {
+      float p = parent_->odu_discharge_pressure_psig_(*data);
+      if (!std::isnan(p)) value = p;
+    }
+  }
   if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_discharge_temp") {
     auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
     if (data) {

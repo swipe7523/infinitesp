@@ -586,8 +586,9 @@ void InfinitESPComponent::handle_passive_frame_() {
 
       // Log decoded ODU data
       if (reg_key == REG_ODU_STATUS2 && data.size() >= 1) {
-        ESP_LOGD("InfinitESP", "ODU 0303: stage=%u raw=[%02X %02X %02X %02X]",
-                 data[0] >> 1, data[0], data.size() > 1 ? data[1] : 0,
+        ESP_LOGD("InfinitESP", "ODU 0303: stage=%u suction=%.1f discharge=%.1f psig raw=[%02X %02X %02X %02X]",
+                 data[0] >> 1, odu_suction_pressure_psig_(data), odu_discharge_pressure_psig_(data),
+                 data[0], data.size() > 1 ? data[1] : 0,
                  data.size() > 2 ? data[2] : 0, data.size() > 3 ? data[3] : 0);
       }
       if (reg_key == REG_ODU_COMP_SPEED) {

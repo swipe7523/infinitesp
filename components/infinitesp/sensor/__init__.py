@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import sensor
-from esphome.const import CONF_ID, CONF_TYPE, STATE_CLASS_MEASUREMENT, DEVICE_CLASS_TEMPERATURE, DEVICE_CLASS_VOLTAGE
+from esphome.const import CONF_ID, CONF_TYPE, STATE_CLASS_MEASUREMENT, DEVICE_CLASS_TEMPERATURE, DEVICE_CLASS_VOLTAGE, DEVICE_CLASS_PRESSURE
 from .. import InfinitESPEntity, CONF_INFINITESP_ID, infinitesp_ns, register_infinitesp_entity
 
 CONF_ZONE = "zone"
@@ -31,6 +31,10 @@ SENSOR_TYPES = {
     # ODU live suction superheat from register 0613 data[52] float32 (\u00b0F\u2192\u00b0C delta).
     # The correct live value; 061f idx2 below is a STATIC target, kept for reference.
     "odu_suction_superheat": {"key": "odu_suction_superheat", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    # ODU refrigerant pressures from register 0303 u16 BE /16 (psig). Confirmed across
+    # an OFF\u2192HIGH transition vs Anantha (suction counter-trended the compressor ramp).
+    "odu_suction_pressure": {"key": "odu_suction_pressure", "unit": "psi", "device_class": DEVICE_CLASS_PRESSURE, "bus_class": 5},
+    "odu_discharge_pressure": {"key": "odu_discharge_pressure", "unit": "psi", "device_class": DEVICE_CLASS_PRESSURE, "bus_class": 5},
     # ODU IEEE754 float32 values from register 061f \u2014 STATIC targets, not live measurements
     "odu_float_1": {"key": "odu_float_1", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_float_2": {"key": "odu_float_2", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
