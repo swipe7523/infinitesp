@@ -184,6 +184,7 @@ static const uint16_t REG_ODU_SETPOINT = 0x060B;   // Target value at byte[2], n
 static const uint16_t REG_ODU_FLOATS = 0x061F;     // IEEE754 float32 array — STATIC superheat/subcooling TARGETS (not live)
 static const uint16_t REG_ODU_FAN = 0x060A;        // Outdoor fan: current RPM u16 BE at data[64]
 static const uint16_t REG_ODU_SUPERHEAT = 0x0613;  // Live refrigerant floats: suction superheat f32 BE at data[52]
+static const uint16_t REG_ODU_POWER = 0x0625;      // Inverter/compressor input power: u16 BE watts at data[0]
 // REG_ODU_RUN_STATUS (0x0602) byte0 low-nibble values, confirmed by heat-vs-cool bus diff.
 static const uint8_t ODU_RUN_COOL = 2;
 static const uint8_t ODU_RUN_HEAT = 3;
@@ -519,6 +520,17 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     if (data.size() < 8) return NAN;
     float p = (float) (((uint16_t) data[6] << 8) | data[7]) / 16.0f;
     return (p >= 0.0f && p <= 700.0f) ? p : NAN;
+  }
+  // ODU register 0625 (REG_ODU_POWER): inverter/compressor input power, u16 BE
+  // watts at data[0]. Confirmed across a 24h heat+cool capture vs Anantha
+  // instant_power (R²=0.98, ~0 intercept); reads ~0 at standby. This is the ODU's
+  // own power draw — Anantha's whole-system instant_power runs ~1.15× higher
+  // (it also counts the indoor blower), so this is published as ODU power, not
+  // relabeled as total system power.
+  static float odu_power_w_(const std::vector<uint8_t> &data) {
+    if (data.size() < 2) return NAN;
+    float w = (float) (((uint16_t) data[0] << 8) | data[1]);
+    return (w >= 0.0f && w <= 20000.0f) ? w : NAN;
   }
 
  protected:

@@ -255,6 +255,16 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
       if (!std::isnan(p)) value = p;
     }
   }
+
+  // ODU inverter/compressor input power from register 0625 data[0] (u16 BE, W).
+  // Confirmed across a 24h heat+cool capture vs Anantha instant_power (R²=0.98).
+  if (register_key == REG_ODU_POWER && sensor_type_ == "odu_power") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_POWER);
+    if (data) {
+      float w = parent_->odu_power_w_(*data);
+      if (!std::isnan(w)) value = w;
+    }
+  }
   if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_discharge_temp") {
     auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
     if (data) {

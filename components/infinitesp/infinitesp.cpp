@@ -649,6 +649,12 @@ void InfinitESPComponent::handle_passive_frame_() {
           ESP_LOGD("InfinitESP", "ODU 0613: suction_superheat=%.1f °F (%u bytes)",
                    sh, data.size());
       }
+      if (reg_key == REG_ODU_POWER) {
+        float w = odu_power_w_(data);
+        if (!std::isnan(w))
+          ESP_LOGD("InfinitESP", "ODU 0625: power=%u W (%u bytes)",
+                   (unsigned) w, data.size());
+      }
 
       notify_entities_(src, reg_key);
     }
