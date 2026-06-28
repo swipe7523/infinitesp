@@ -52,8 +52,8 @@ climate::ClimateTraits InfinitESPClimate::traits() {
 
 void InfinitESPClimate::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
-    this->mode = call.get_mode().value();
     auto mode = call.get_mode().value();
+    this->mode = mode;
     uint8_t sys = SYSMODE_OFF;
     switch (mode) {
       case climate::CLIMATE_MODE_HEAT:      sys = SYSMODE_HEAT; break;
@@ -99,8 +99,8 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
   }
 
   if (call.get_fan_mode().has_value()) {
-    this->fan_mode = call.get_fan_mode().value();
     auto fan = call.get_fan_mode().value();
+    this->fan_mode = fan;
     uint8_t fm = FAN_AUTO;
     switch (fan) {
       case climate::CLIMATE_FAN_AUTO:   fm = FAN_AUTO; break;
@@ -113,30 +113,24 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
     fan_mode_ = fm;
   }
 
-  // Handle standard presets — activity-based holds using comfort profiles from 400A
+  // Handle standard presets — activity-based holds using comfort profiles from 400A.
+  // Each maps to a comfort activity applied as a permanent hold.
   if (call.get_preset().has_value()) {
     auto preset = call.get_preset().value();
-    switch (preset) {
-      case climate::CLIMATE_PRESET_HOME:
-        parent_->apply_activity(zone_, COMFORT_HOME, InfinitESPComponent::HOLD_PERMANENT);
-        this->set_preset_(preset);
-        hold_duration_ = InfinitESPComponent::HOLD_PERMANENT;
-        last_activity_ = COMFORT_HOME;
-        break;
-      case climate::CLIMATE_PRESET_AWAY:
-        parent_->apply_activity(zone_, COMFORT_AWAY, InfinitESPComponent::HOLD_PERMANENT);
-        this->set_preset_(preset);
-        hold_duration_ = InfinitESPComponent::HOLD_PERMANENT;
-        last_activity_ = COMFORT_AWAY;
-        break;
-      case climate::CLIMATE_PRESET_SLEEP:
-        parent_->apply_activity(zone_, COMFORT_SLEEP, InfinitESPComponent::HOLD_PERMANENT);
-        this->set_preset_(preset);
-        hold_duration_ = InfinitESPComponent::HOLD_PERMANENT;
-        last_activity_ = COMFORT_SLEEP;
-        break;
-      default:
-        break;
+    struct PresetMap { climate::ClimatePreset preset; uint8_t activity; };
+    static const PresetMap preset_map[] = {
+      {climate::CLIMATE_PRESET_HOME,  COMFORT_HOME},
+      {climate::CLIMATE_PRESET_AWAY,  COMFORT_AWAY},
+      {climate::CLIMATE_PRESET_SLEEP, COMFORT_SLEEP},
+    };
+    for (const auto &pm : preset_map) {
+      if (preset != pm.preset)
+        continue;
+      parent_->apply_activity(zone_, pm.activity, InfinitESPComponent::HOLD_PERMANENT);
+      this->set_preset_(preset);
+      hold_duration_ = InfinitESPComponent::HOLD_PERMANENT;
+      last_activity_ = pm.activity;
+      break;
     }
   }
 

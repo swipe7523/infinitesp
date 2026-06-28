@@ -70,6 +70,11 @@ class InfinitESPCover : public cover::Cover, public InfinitESPEntity {
   Trigger<float> *get_change_trigger() { return &change_trigger_; }
 
  private:
+  // Act on a newly-commanded damper step (0x00-0x0F): if it differs from the
+  // last step acted on, publish the position and fire the change trigger.
+  // Shared by control() (HA) and on_register_update() (bus) — one anchor.
+  void apply_step_(uint8_t new_step);
+
   Trigger<float> change_trigger_;
   uint8_t last_step_{0xFF};  // last commanded step acted on; 0xFF = never (forces first fire)
 };

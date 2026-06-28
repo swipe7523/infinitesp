@@ -404,6 +404,14 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     return (float) raw / 16.0f;
   }
 
+  // Decode raw big-endian uint16 from byte vector. Returns 0 when out of range;
+  // accessors that need a NAN sentinel keep their own size guard (below).
+  static uint16_t decode_u16_be_(const std::vector<uint8_t> &data, size_t offset) {
+    if (offset + 2 > data.size())
+      return 0;
+    return ((uint16_t) data[offset] << 8) | data[offset + 1];
+  }
+
   // --- IDU/ODU field accessors: single source of truth for register offsets ---
   // Pure decoders of a register's byte vector. Native units (°F for ODU temps,
   // raw counts for RPM/CFM, native float for 061F). Return NAN if the field
@@ -414,12 +422,12 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // IDU register 0306 (REG_IDU_STATUS): blower RPM, u16 BE at [1..2]
   static float idu_blower_rpm_(const std::vector<uint8_t> &data) {
     if (data.size() < 3) return NAN;
-    return (float) (((uint16_t) data[1] << 8) | data[2]);
+    return (float) decode_u16_be_(data, 1);
   }
   // IDU register 0316 (REG_IDU_CONFIG): airflow CFM u16 BE at [4..5]
   static float idu_airflow_cfm_(const std::vector<uint8_t> &data) {
     if (data.size() < 6) return NAN;
-    return (float) (((uint16_t) data[4] << 8) | data[5]);
+    return (float) decode_u16_be_(data, 4);
   }
   // IDU register 0316: electric heat present, data[0] & 0x03
   static bool idu_electric_heat_(const std::vector<uint8_t> &data) {
@@ -428,14 +436,14 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // ODU register 0604 (REG_ODU_COMP_SPEED): current compressor RPM, u16 BE at [0..1]
   static float odu_compressor_rpm_(const std::vector<uint8_t> &data) {
     if (data.size() < 2) return NAN;
-    return (float) (((uint16_t) data[0] << 8) | data[1]);
+    return (float) decode_u16_be_(data, 0);
   }
   // ODU register 0608 (REG_ODU_DEMAND): compressor drive frequency, u16 BE at [5..6], 0.1 Hz
   // Scale confirmed for stages 1-4 against Carrier rated RPM (4-pole motor, sync rpm = 3*v);
   // stage 5 (144 Hz) predicted, not yet measured. See private/DEVLOG.md 2026-06-23.
   static float odu_compressor_frequency_(const std::vector<uint8_t> &data) {
     if (data.size() < 7) return NAN;
-    return (float) (((uint16_t) data[5] << 8) | data[6]) / 10.0f;
+    return (float) decode_u16_be_(data, 5) / 10.0f;
   }
   // ODU register 060e (REG_ODU_STAGE_INFO): variable-speed stage index at byte 0
   // {0=off, 1..5=stage}. Verified against rpm-derived stage; resolves the
@@ -493,7 +501,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // Confirmed by state-tracking vs Anantha outdoor_fan_rpm (385→400 tracked 380→405).
   static float odu_outdoor_fan_rpm_(const std::vector<uint8_t> &data) {
     if (data.size() < 66) return NAN;
-    return (float) (((uint16_t) data[64] << 8) | data[65]);
+    return (float) decode_u16_be_(data, 64);
   }
   // ODU register 0613 (REG_ODU_SUPERHEAT): LIVE suction superheat, float32 BE at
   // data[52], native °F delta. Confirmed vs Anantha suction_superheat (20.41→21.63
@@ -513,12 +521,12 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // is stale; replies carry >= 8 data bytes.)
   static float odu_suction_pressure_psig_(const std::vector<uint8_t> &data) {
     if (data.size() < 4) return NAN;
-    float p = (float) (((uint16_t) data[2] << 8) | data[3]) / 16.0f;
+    float p = (float) decode_u16_be_(data, 2) / 16.0f;
     return (p >= 0.0f && p <= 700.0f) ? p : NAN;  // refrigerant pressure plausibility
   }
   static float odu_discharge_pressure_psig_(const std::vector<uint8_t> &data) {
     if (data.size() < 8) return NAN;
-    float p = (float) (((uint16_t) data[6] << 8) | data[7]) / 16.0f;
+    float p = (float) decode_u16_be_(data, 6) / 16.0f;
     return (p >= 0.0f && p <= 700.0f) ? p : NAN;
   }
   // ODU register 0625 (REG_ODU_POWER): inverter/compressor input power, u16 BE
@@ -529,7 +537,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // relabeled as total system power.
   static float odu_power_w_(const std::vector<uint8_t> &data) {
     if (data.size() < 2) return NAN;
-    float w = (float) (((uint16_t) data[0] << 8) | data[1]);
+    float w = (float) decode_u16_be_(data, 0);
     return (w >= 0.0f && w <= 20000.0f) ? w : NAN;
   }
 

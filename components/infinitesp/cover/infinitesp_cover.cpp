@@ -10,6 +10,16 @@ cover::CoverTraits InfinitESPCover::get_traits() {
   return traits;
 }
 
+void InfinitESPCover::apply_step_(uint8_t new_step) {
+  if (new_step == last_step_)
+    return;  // same step we last acted on — no change, no fire, no publish
+  last_step_ = new_step;
+  this->position = new_step / 15.0f;
+  this->current_operation = cover::COVER_OPERATION_IDLE;
+  this->change_trigger_.trigger(this->position);
+  this->publish_state();
+}
+
 void InfinitESPCover::control(const cover::CoverCall &call) {
   // HA command. ESPHome maps open→1.0, close→0.0, slider→value, all as a
   // position. The cover never writes the bus: fire the same trigger the bus
@@ -21,14 +31,7 @@ void InfinitESPCover::control(const cover::CoverCall &call) {
   // Quantize to the protocol's 16 steps so a re-command of the current step
   // (e.g. HA slider at 0.53 while the cover sits at step 8 = 0.533…) does not
   // spuriously fire. Anchor: last_step_ (0xFF sentinel fires the first time).
-  uint8_t new_step = (uint8_t) lroundf(*pos * 15.0f);
-  if (new_step == last_step_)
-    return;  // same step we last acted on — no change, no fire, no publish
-  last_step_ = new_step;
-  this->position = new_step / 15.0f;
-  this->current_operation = cover::COVER_OPERATION_IDLE;
-  this->change_trigger_.trigger(this->position);
-  this->publish_state();
+  apply_step_((uint8_t) lroundf(*pos * 15.0f));
 }
 
 void InfinitESPCover::on_register_update(uint8_t device_addr, uint16_t register_key) {
@@ -49,14 +52,7 @@ void InfinitESPCover::on_register_update(uint8_t device_addr, uint16_t register_
   // transient (control()) snapping back to the bus value still fires when the
   // steps actually differ. Anchor: last_step_ (0xFF sentinel fires the first
   // time, so a zone fully-open at boot still actuates).
-  uint8_t new_step = data->at(zone_ - 1);
-  if (new_step == last_step_)
-    return;  // same step we last acted on — nothing to do
-  last_step_ = new_step;
-  this->position = new_step / 15.0f;
-  this->current_operation = cover::COVER_OPERATION_IDLE;
-  this->change_trigger_.trigger(this->position);
-  this->publish_state();
+  apply_step_(data->at(zone_ - 1));
 }
 
 }  // namespace infinitesp

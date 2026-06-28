@@ -45,101 +45,51 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     }
   }
 
-  // Thermostat vacation settings (4012)
-  if (register_key == REG_TSTAT_VACATION && sensor_type_ == "vacation_min_temp") {
+  // Thermostat vacation settings (4012): min at byte 0, max at byte 1.
+  if (register_key == REG_TSTAT_VACATION &&
+      (sensor_type_ == "vacation_min_temp" || sensor_type_ == "vacation_max_temp")) {
     auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_VACATION);
     if (data && data->size() >= 2)
-      value = parent_->setpoint_to_celsius(data->at(0));
-  }
-  if (register_key == REG_TSTAT_VACATION && sensor_type_ == "vacation_max_temp") {
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_VACATION);
-    if (data && data->size() >= 2)
-      value = parent_->setpoint_to_celsius(data->at(1));
+      value = parent_->setpoint_to_celsius(data->at(sensor_type_ == "vacation_min_temp" ? 0 : 1));
   }
 
-  // IDU (Indoor Unit) passively snooped registers
-  // Blower RPM from register 0306
-  if (register_key == REG_IDU_STATUS && sensor_type_ == "blower_rpm") {
-    auto *data = parent_->get_register(device_addr, REG_IDU_STATUS);
-    if (data) {
-      float rpm = parent_->idu_blower_rpm_(*data);
-      if (!std::isnan(rpm))
-        value = rpm;
-    }
-  }
-
-  // Airflow CFM from register 0316
-  if (register_key == REG_IDU_CONFIG && sensor_type_ == "airflow_cfm") {
-    auto *data = parent_->get_register(device_addr, REG_IDU_CONFIG);
-    if (data) {
-      float cfm = parent_->idu_airflow_cfm_(*data);
-      if (!std::isnan(cfm))
-        value = cfm;
-    }
-  }
-
-  // ODU (Outdoor Unit) passively snooped registers
-  // Compressor RPM from register 0604 (first uint16 BE pair = current speed)
-  if (register_key == REG_ODU_COMP_SPEED && sensor_type_ == "compressor_rpm") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_COMP_SPEED);
-    if (data) {
-      float rpm = parent_->odu_compressor_rpm_(*data);
-      if (!std::isnan(rpm))
-        value = rpm;
-    }
-  }
-
-  // Compressor drive frequency from register 0608 (uint16 BE at [5..6], 0.1 Hz)
-  if (register_key == REG_ODU_DEMAND && sensor_type_ == "compressor_frequency") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_DEMAND);
-    if (data) {
-      float f = parent_->odu_compressor_frequency_(*data);
-      if (!std::isnan(f))
-        value = f;
-    }
-  }
-
-  // Variable-speed stage index from register 060e (byte 0: 0=off, 1..5=stage)
-  if (register_key == REG_ODU_STAGE_INFO && sensor_type_ == "odu_stage") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STAGE_INFO);
-    if (data) {
-      float s = parent_->odu_stage_(*data);
-      if (!std::isnan(s))
-        value = s;
-    }
-  }
-
-  // Commanded compressor stage from register 0605 (float32 BE at [0..3]: 0.0/1.0..5.0)
-  // Write-only (thermostat→ODU); captured in handle_passive_frame_. Drives the
-  // actual stage (060e) with ~15s lag.
-  if (register_key == REG_ODU_CMD_STAGE && sensor_type_ == "odu_commanded_stage") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_CMD_STAGE);
-    if (data) {
-      float s = parent_->odu_commanded_stage_(*data);
-      if (!std::isnan(s))
-        value = s;
-    }
-  }
-
-
-  // ODU line voltage from register 0304 byte 7 (whole volts, state-independent).
-  // Validated against Carrier cloud linevolt: bus 238-240 vs cloud 239V.
-  if (register_key == REG_ODU_STATUS3 && sensor_type_ == "odu_line_voltage") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS3);
-    if (data) {
-      float v = parent_->odu_line_voltage_(*data);
-      if (!std::isnan(v))
-        value = v;
-    }
-  }
-
-  // ODU operating mode from register 0304 (byte 11 of payload, which is data[10])
-  if (register_key == REG_ODU_STATUS3 && sensor_type_ == "odu_operating_mode") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS3);
-    if (data) {
-      float mode = parent_->odu_operating_mode_(*data);
-      if (!std::isnan(mode))
-        value = mode;
+  // Pass-through diagnostic sensors. Each reads one register and publishes its
+  // decoder's value verbatim (NAN → no publish). The offset/scale lives in the
+  // matching InfinitESPComponent accessor — the single source of truth for the
+  // register layout (see infinitesp.h); this table only maps sensor_type →
+  // (register, decoder). Source registers: 0306 blower rpm, 0316 airflow cfm,
+  // 0604 compressor rpm, 0608 drive freq (0.1 Hz), 060e stage, 0605 commanded
+  // stage, 0304 line voltage / operating mode, 060a outdoor fan rpm, 0303
+  // suction/discharge pressure (psig), 0625 inverter power (W). Sensors needing
+  // a post-decode unit conversion (ODU temps, superheat, 061f) stay below.
+  struct SimpleSensor {
+    const char *type;
+    uint16_t reg;
+    float (*decode)(const std::vector<uint8_t> &);
+  };
+  static const SimpleSensor simple_sensors[] = {
+    {"blower_rpm",             REG_IDU_STATUS,     InfinitESPComponent::idu_blower_rpm_},
+    {"airflow_cfm",            REG_IDU_CONFIG,     InfinitESPComponent::idu_airflow_cfm_},
+    {"compressor_rpm",         REG_ODU_COMP_SPEED, InfinitESPComponent::odu_compressor_rpm_},
+    {"compressor_frequency",   REG_ODU_DEMAND,     InfinitESPComponent::odu_compressor_frequency_},
+    {"odu_stage",              REG_ODU_STAGE_INFO, InfinitESPComponent::odu_stage_},
+    {"odu_commanded_stage",    REG_ODU_CMD_STAGE,  InfinitESPComponent::odu_commanded_stage_},
+    {"odu_line_voltage",       REG_ODU_STATUS3,    InfinitESPComponent::odu_line_voltage_},
+    {"odu_operating_mode",     REG_ODU_STATUS3,    InfinitESPComponent::odu_operating_mode_},
+    {"odu_fan_rpm",            REG_ODU_FAN,        InfinitESPComponent::odu_outdoor_fan_rpm_},
+    {"odu_suction_pressure",   REG_ODU_STATUS2,    InfinitESPComponent::odu_suction_pressure_psig_},
+    {"odu_discharge_pressure", REG_ODU_STATUS2,    InfinitESPComponent::odu_discharge_pressure_psig_},
+    {"odu_power",              REG_ODU_POWER,      InfinitESPComponent::odu_power_w_},
+  };
+  for (const auto &s : simple_sensors) {
+    if (register_key == s.reg && sensor_type_ == s.type) {
+      auto *data = parent_->get_register(device_addr, s.reg);
+      if (data) {
+        float v = s.decode(*data);
+        if (!std::isnan(v))
+          value = v;
+      }
+      break;
     }
   }
 
@@ -175,57 +125,34 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     }
   }
 
-  // ODU register 0302: int16 BE / 16, always native °F. Convert to °C.
-  // Field idx via accessor odu_status1_meas_f_(idx): 0=outdoor 1=coil 2=suction
-  // 3=subcooling(ΔT) 4=indoor_amb 5=discharge. idx 3 is a delta (no -32).
-  if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_outdoor_temp") {
+  // ODU register 0302 temperatures: int16 BE / 16, native °F → °C. Field idx via
+  // odu_status1_meas_f_(idx): 0=outdoor 1=coil 2=suction 5=discharge are real
+  // temps; idx 3/4 are NOT subcooling/indoor-ambient — cross-referenced against
+  // Anantha MQTT, those offsets decode to ~329°F/348°F (non-temperature data) and
+  // were publishing ~182°C/175°C garbage. odu_status1_temp_f_ band-rejects idx
+  // 3/4 → NAN → no publish, until the real offsets are found. (0302 is not a
+  // clean 6-slot temp array; only idx 0/1/2/5 are temps.) idx 3 is a ΔT delta.
+  struct OduTemp { const char *type; uint8_t idx; bool guarded; bool is_delta; };
+  static const OduTemp odu_temps[] = {
+    {"odu_outdoor_temp",        0, false, false},
+    {"odu_coil_temp",           1, false, false},
+    {"odu_suction_temp",        2, false, false},
+    {"odu_subcooling_degf_int", 3, true,  true},   // band-guarded, ΔT delta (no -32)
+    {"odu_indoor_ambient",      4, true,  false},  // band-guarded
+    {"odu_discharge_temp",      5, false, false},
+  };
+  if (register_key == REG_ODU_STATUS1) {
     auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
     if (data) {
-      float f = parent_->odu_status1_meas_f_(*data, 0);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
-    }
-  }
-  if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_coil_temp") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
-    if (data) {
-      float f = parent_->odu_status1_meas_f_(*data, 1);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
-    }
-  }
-  if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_suction_temp") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
-    if (data) {
-      float f = parent_->odu_status1_meas_f_(*data, 2);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
-    }
-  }
-  // 0302 idx 3/4 do NOT carry subcooling / indoor-ambient: cross-referenced against
-  // Anantha MQTT, these offsets decode to ~329°F/348°F (non-temperature data) and
-  // were publishing ~182°C/175°C to HA. odu_status1_temp_f_ band-rejects them → NAN
-  // → no publish, until the correct offsets are reverse-engineered. (issue: 0302 is
-  // not a clean 6-slot temp array; only idx 0/1/2/5 are temps.)
-  if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_subcooling_degf_int") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
-    if (data) {
-      float f = parent_->odu_status1_temp_f_(*data, 3);
-      if (!std::isnan(f)) value = f * (5.0f / 9.0f);  // delta °F → delta °C
-    }
-  }
-  if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_indoor_ambient") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
-    if (data) {
-      float f = parent_->odu_status1_temp_f_(*data, 4);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
-    }
-  }
-
-  // Outdoor fan RPM from ODU register 060A data[64] (u16 BE). Confirmed vs Anantha.
-  if (register_key == REG_ODU_FAN && sensor_type_ == "odu_fan_rpm") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
-    if (data) {
-      float rpm = parent_->odu_outdoor_fan_rpm_(*data);
-      if (!std::isnan(rpm))
-        value = rpm;
+      for (const auto &t : odu_temps) {
+        if (sensor_type_ != t.type)
+          continue;
+        float f = t.guarded ? parent_->odu_status1_temp_f_(*data, t.idx)
+                            : parent_->odu_status1_meas_f_(*data, t.idx);
+        if (!std::isnan(f))
+          value = t.is_delta ? f * (5.0f / 9.0f) : (f - 32.0f) * (5.0f / 9.0f);
+        break;
+      }
     }
   }
 
@@ -239,48 +166,13 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     }
   }
 
-  // Refrigerant pressures from ODU register 0303 (u16 BE /16, psig). Confirmed
-  // across an OFF→HIGH transition vs Anantha (suction counter-trended the ramp).
-  if (register_key == REG_ODU_STATUS2 && sensor_type_ == "odu_suction_pressure") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS2);
-    if (data) {
-      float p = parent_->odu_suction_pressure_psig_(*data);
-      if (!std::isnan(p)) value = p;
-    }
-  }
-  if (register_key == REG_ODU_STATUS2 && sensor_type_ == "odu_discharge_pressure") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS2);
-    if (data) {
-      float p = parent_->odu_discharge_pressure_psig_(*data);
-      if (!std::isnan(p)) value = p;
-    }
-  }
-
-  // ODU inverter/compressor input power from register 0625 data[0] (u16 BE, W).
-  // Confirmed across a 24h heat+cool capture vs Anantha instant_power (R²=0.98).
-  if (register_key == REG_ODU_POWER && sensor_type_ == "odu_power") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_POWER);
-    if (data) {
-      float w = parent_->odu_power_w_(*data);
-      if (!std::isnan(w)) value = w;
-    }
-  }
-  if (register_key == REG_ODU_STATUS1 && sensor_type_ == "odu_discharge_temp") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_STATUS1);
-    if (data) {
-      float f = parent_->odu_status1_meas_f_(*data, 5);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
-    }
-  }
-
   // --- ZC zone temperatures (register 0302, ZC device address 0x60) ---
   // Per-zone: [tag, id, value_hi, value_lo] where °F = uint16_BE / 16
   if (register_key == REG_ZC_ZONE_STATUS && sensor_type_ == "zc_zone_temperature") {
     auto *data = parent_->get_register(device_addr, REG_ZC_ZONE_STATUS);
     if (data && data->size() == 24 && zone_ >= 2 && zone_ <= 4) {
       uint8_t off_hi = 4 + (zone_ - 2) * 4 + 2;
-      uint8_t off_lo = off_hi + 1;
-      uint16_t raw = ((uint16_t) data->at(off_hi) << 8) | data->at(off_lo);
+      uint16_t raw = InfinitESPComponent::decode_u16_be_(*data, off_hi);
       float temp_f = (float) raw / ZC_TEMP_SCALE;
       value = (temp_f - 32.0f) * (5.0f / 9.0f);  // °F → °C for HA
     }

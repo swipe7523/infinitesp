@@ -65,91 +65,31 @@ void InfinitESPTextSensor::on_register_update(uint8_t device_addr, uint16_t regi
     return;
   }
 
-  // Thermostat WiFi SSID from 4608
-  if (sensor_type_ == "tstat_ssid") {
-    if (register_key != REG_TSTAT_WIFI)
+  // Fixed-offset C-string fields from the thermostat's WiFi (4608), cloud (4609)
+  // and dealer (460A) registers. Each entry is {type, register, min_size, offset}:
+  // publish the NUL-terminated string at `offset` once the register holds at
+  // least `min_size` bytes. min_size == offset + 1 (the byte at `offset` must
+  // exist); a min_size of 1 / offset 0 means "any non-empty payload".
+  struct StringField { const char *type; uint16_t reg; size_t min_size; size_t offset; };
+  static const StringField string_fields[] = {
+    {"tstat_ssid",         REG_TSTAT_WIFI,    25,  24},   // 4608
+    {"tstat_hostname",     REG_TSTAT_WIFI,    140, 139},
+    {"tstat_wifi_mac",     REG_TSTAT_WIFI,    5,   4},
+    {"tstat_cloud_host",   REG_TSTAT_CLOUD,   1,   0},    // 4609
+    {"tstat_proxy_server", REG_TSTAT_CLOUD,   68,  67},
+    {"tstat_dealer_name",  REG_TSTAT_DEALER,  1,   0},    // 460A
+    {"tstat_dealer_brand", REG_TSTAT_DEALER,  51,  50},
+    {"tstat_dealer_url",   REG_TSTAT_DEALER,  71,  70},
+  };
+  for (const auto &sf : string_fields) {
+    if (sensor_type_ != sf.type)
+      continue;
+    if (register_key != sf.reg)
       return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_WIFI);
-    if (!data || data->size() < 25)
+    auto *data = parent_->get_register(ADDR_THERMOSTAT, sf.reg);
+    if (!data || data->size() < sf.min_size)
       return;
-    publish_state(extract_cstr(*data, 24));
-    return;
-  }
-
-  // Thermostat WiFi hostname from 4608
-  if (sensor_type_ == "tstat_hostname") {
-    if (register_key != REG_TSTAT_WIFI)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_WIFI);
-    if (!data || data->size() < 140)
-      return;
-    publish_state(extract_cstr(*data, 139));
-    return;
-  }
-
-  // Thermostat WiFi MAC address from 4608
-  if (sensor_type_ == "tstat_wifi_mac") {
-    if (register_key != REG_TSTAT_WIFI)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_WIFI);
-    if (!data || data->size() < 5)
-      return;
-    publish_state(extract_cstr(*data, 4));
-    return;
-  }
-
-  // Thermostat cloud host from 4609
-  if (sensor_type_ == "tstat_cloud_host") {
-    if (register_key != REG_TSTAT_CLOUD)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_CLOUD);
-    if (!data || data->empty())
-      return;
-    publish_state(extract_cstr(*data, 0));
-    return;
-  }
-
-  // Thermostat proxy server IP from 4609
-  if (sensor_type_ == "tstat_proxy_server") {
-    if (register_key != REG_TSTAT_CLOUD)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_CLOUD);
-    if (!data || data->size() < 68)
-      return;
-    publish_state(extract_cstr(*data, 67));
-    return;
-  }
-
-  // Dealer name from 460A
-  if (sensor_type_ == "tstat_dealer_name") {
-    if (register_key != REG_TSTAT_DEALER)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_DEALER);
-    if (!data || data->empty())
-      return;
-    publish_state(extract_cstr(*data, 0));
-    return;
-  }
-
-  // Dealer brand from 460A
-  if (sensor_type_ == "tstat_dealer_brand") {
-    if (register_key != REG_TSTAT_DEALER)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_DEALER);
-    if (!data || data->size() < 51)
-      return;
-    publish_state(extract_cstr(*data, 50));
-    return;
-  }
-
-  // Dealer URL from 460A
-  if (sensor_type_ == "tstat_dealer_url") {
-    if (register_key != REG_TSTAT_DEALER)
-      return;
-    auto *data = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_DEALER);
-    if (!data || data->size() < 71)
-      return;
-    publish_state(extract_cstr(*data, 70));
+    publish_state(extract_cstr(*data, sf.offset));
     return;
   }
 

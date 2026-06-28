@@ -20,6 +20,14 @@ static const uint8_t FAN_COUNT = 4;
 static const char *const DAY_NAMES[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY",
                                         "THURSDAY", "FRIDAY", "SATURDAY"};
 
+// Look up a name in an indexed table, returning its index, or 0xFF if not found.
+static uint8_t name_to_index(const std::string &name, const char *const *names, uint8_t count) {
+  for (uint8_t i = 0; i < count; i++)
+    if (name == names[i])
+      return i;
+  return 0xFF;
+}
+
 // UTF-8 degree symbol for temperature output
 static const char DEGREE_UTF8[] = "\xC2\xB0";
 
@@ -205,10 +213,7 @@ void SamAsciiComponent::process_line_(const std::string &line) {
     std::string write_val = body.substr(bang + 1);
 
     if (write_cmd == "MODE") {
-      uint8_t new_mode = 0xFF;
-      for (uint8_t i = 0; i < MODE_COUNT; i++) {
-        if (write_val == MODE_NAMES[i]) { new_mode = i; break; }
-      }
+      uint8_t new_mode = name_to_index(write_val, MODE_NAMES, MODE_COUNT);
       if (new_mode == 0xFF) { respond_nak_(prefix, "VAL"); return; }
       parent_->set_system_mode(new_mode);
       respond_(prefix, "ACK");
@@ -236,10 +241,7 @@ void SamAsciiComponent::process_line_(const std::string &line) {
     }
 
     if (write_cmd == "FAN") {
-      uint8_t new_fan = 0xFF;
-      for (uint8_t i = 0; i < FAN_COUNT; i++) {
-        if (write_val == FAN_NAMES[i]) { new_fan = i; break; }
-      }
+      uint8_t new_fan = name_to_index(write_val, FAN_NAMES, FAN_COUNT);
       if (new_fan == 0xFF) { respond_nak_(prefix, "VAL"); return; }
       parent_->set_zone_fan(zone, new_fan);
       respond_(prefix, "ACK");
@@ -430,14 +432,8 @@ void SamAsciiComponent::respond_(const std::string &prefix, const std::string &v
 }
 
 void SamAsciiComponent::respond_nak_(const std::string &prefix, const std::string &reason) {
-  std::string response;
-  if (!prefix.empty())
-    response = prefix + ": ";
-  if (reason.empty())
-    response += "NAK";
-  else
-    response += "NAK " + reason;
-  response += "\r\n";
+  std::string response = (prefix.empty() ? "" : prefix + ": ") +
+                         (reason.empty() ? "NAK" : "NAK " + reason) + "\r\n";
   ESP_LOGD(TAG, "TX: '%s'", response.c_str());
   write_str(response.c_str());
   flush();
