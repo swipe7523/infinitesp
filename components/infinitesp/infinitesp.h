@@ -571,6 +571,21 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   void handle_write_request_();
   void handle_reply_();
 
+  // Body of the current frame's payload: the bytes after the 3-byte
+  // [active_zones/reserved, table, row] register header. Empty if the payload
+  // is too short to have a body.
+  std::vector<uint8_t> frame_payload_body_() const {
+    const auto &p = current_frame_.payload;
+    return p.size() > 3 ? std::vector<uint8_t>(p.begin() + 3, p.end()) : std::vector<uint8_t>();
+  }
+
+  // Capture a thermostat damper command (0308) into the ZC's 0308 + mirrored
+  // 0319 registers and notify entities. Shared by the emulated-ZC write path
+  // and the passive physical-ZC snoop path; `addr` is the ZC address, `context`
+  // tags the debug log (e.g. " (passive)").
+  void store_zc_damper_command_(uint8_t addr, const std::vector<uint8_t> &payload,
+                                const char *context);
+
   void poll_thermostat_();
   void initialize_defaults_();
   void update_zc_zone_temp_(uint8_t zone, float temp_f);
