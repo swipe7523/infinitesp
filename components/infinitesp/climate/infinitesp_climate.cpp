@@ -237,6 +237,15 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
       // requested mode and action is IDLE regardless.
       last_stage_ = stage;
       last_mode_ = mode;
+      // Invalidate the cached ODU direction when the system goes idle. last_odu_dir_
+      // only refreshes when a 0602 frame arrives, but 0602 is polled far less often
+      // than 3B02 updates. Without this, a new cycle (stage 0→>0 in AUTO) inherits the
+      // PREVIOUS cycle's direction and briefly shows e.g. Heating while actually
+      // Cooling, until the next 0602 lands. Clearing on idle makes a fresh cycle show
+      // IDLE (action requires stage>0 anyway) until the real direction is confirmed —
+      // briefly idle beats confidently wrong.
+      if (stage == 0)
+        last_odu_dir_ = 0;
       // AUTO during stage>0 is normal: variable-speed equipment leaves the 3B02
       // mode nibble at AUTO during active operation (issue #7). Direction is
       // resolved independently from the ODU 0602 run-status register, so this
