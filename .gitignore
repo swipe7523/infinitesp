@@ -15,3 +15,6 @@ DEVLOG.md
 .claude/
 private/
 infinitesp-*.yaml
+
+# Reverse-engineering captures + analysis scripts (Anantha cross-reference)
+scratchpad/
