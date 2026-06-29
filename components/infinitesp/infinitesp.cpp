@@ -560,7 +560,7 @@ void InfinitESPComponent::handle_passive_frame_() {
     uint8_t src = current_frame_.src;
     uint8_t src_class = src >> 4;
     uint16_t reg_key = (current_frame_.payload[1] << 8) | current_frame_.payload[2];
-    auto data = frame_payload_body_();
+    const auto &data = frame_payload_body_();
 
     // Protocol-native device discovery: learn IDU/ODU addresses from the 0104
     // nameplate instead of assuming the address-nibble convention holds.
@@ -700,7 +700,7 @@ void InfinitESPComponent::handle_passive_frame_() {
     if (reg_key == REG_SAM_ACTIVITY) {
       ESP_LOGD("InfinitESP", "Activity notification from %02X", current_frame_.src);
       if (current_frame_.payload.size() > 3) {
-        auto data = frame_payload_body_();
+        const auto &data = frame_payload_body_();
         store_register_(current_frame_.src, reg_key, data);
         notify_entities_(current_frame_.src, reg_key);
       }
@@ -723,7 +723,7 @@ void InfinitESPComponent::handle_passive_frame_() {
     // Mirror the data to SAM address so climate/sensor entities get current values.
     if (sam_enabled() && reg_key == REG_SAM_STATE && current_frame_.src == ADDR_THERMOSTAT) {
       if (current_frame_.payload.size() > 3) {
-        auto data = frame_payload_body_();
+        const auto &data = frame_payload_body_();
         ESP_LOGD("InfinitESP", "Broadcast 3B02 state update (%u bytes)", data.size());
         mirror_to_sam_(reg_key, data);
         notify_entities_(sam_address_, reg_key);
@@ -738,7 +738,7 @@ void InfinitESPComponent::handle_passive_frame_() {
     // 061f/0625).
     if (is_odu_addr(current_frame_.dst) && current_frame_.src == ADDR_THERMOSTAT &&
         current_frame_.payload.size() > 3) {
-      auto odu_data = frame_payload_body_();
+      const auto &odu_data = frame_payload_body_();
       store_register_(current_frame_.dst, reg_key, odu_data);
       if (reg_key == REG_ODU_CMD_STAGE && odu_data.size() >= 4) {
         ESP_LOGD("InfinitESP", "ODU 0605 write: commanded_stage=%.1f", (double) odu_commanded_stage_(odu_data));
@@ -922,7 +922,7 @@ void InfinitESPComponent::handle_write_request_() {
     // 3404: heartbeat — 1-byte ACK
     if (reg_key == REG_ZC_HEARTBEAT) {
       if (current_frame_.payload.size() > 3) {
-        auto data = frame_payload_body_();
+        const auto &data = frame_payload_body_();
         store_register_(dest, reg_key, data);
       }
       send_reply_(current_frame_.src, current_frame_.src_bus, dest, current_frame_.dst_bus, {0x00});
@@ -938,7 +938,7 @@ void InfinitESPComponent::handle_write_request_() {
 
   // Generic write handling (SAM writes and unhandled ZC writes)
   if (current_frame_.payload.size() > 3) {
-    auto data = frame_payload_body_();
+    const auto &data = frame_payload_body_();
     // Protect device identity from being overwritten
     if (reg_key != REG_DEVICE_INFO) {
       store_register_(dest, reg_key, data);
@@ -970,7 +970,7 @@ void InfinitESPComponent::handle_reply_() {
 
   // Store under the source device's address and notify
   if (current_frame_.payload.size() > 3) {
-    auto data = frame_payload_body_();
+    const auto &data = frame_payload_body_();
     store_register_(current_frame_.src, reg_key, data);
 
     // Mirror state/zones registers to SAM's own address so READ requests

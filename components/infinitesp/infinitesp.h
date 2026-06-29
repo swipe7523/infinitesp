@@ -610,9 +610,23 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // Body of the current frame's payload: the bytes after the 3-byte
   // [active_zones/reserved, table, row] register header. Empty if the payload
   // is too short to have a body.
-  std::vector<uint8_t> frame_payload_body_() const {
+  //
+  // Returns a reference to a reusable member buffer (frame_body_) rather than a
+  // fresh vector: assign() reuses the buffer's existing capacity, so after
+  // warmup this performs no per-frame heap allocation (the prior by-value form
+  // malloc'd + freed a vector on every snooped/replied frame, churning DRAM and
+  // fragmenting the heap over long uptimes). The reference is valid until the
+  // next call; each frame handler calls this at most once and the only other
+  // callers of the result (store_register_, mirror_to_sam_, learn_device_) take
+  // it by const ref without re-invoking this method, so holding the reference
+  // for the handler's duration is safe.
+  const std::vector<uint8_t> &frame_payload_body_() {
     const auto &p = current_frame_.payload;
-    return p.size() > 3 ? std::vector<uint8_t>(p.begin() + 3, p.end()) : std::vector<uint8_t>();
+    if (p.size() > 3)
+      frame_body_.assign(p.begin() + 3, p.end());
+    else
+      frame_body_.clear();
+    return frame_body_;
   }
 
   // Capture a thermostat damper command (0308) into the ZC's 0308 + mirrored
@@ -670,6 +684,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
 
   std::vector<uint8_t> rx_buffer_;
   std::vector<uint8_t> rx_hex_log_;
+  std::vector<uint8_t> frame_body_;  // reusable buffer backing frame_payload_body_()
   InfinitESPFrame current_frame_;
   std::vector<InfinitESPEntity *> entities_;
   uint8_t sam_address_{ADDR_FAKESAM};
