@@ -32,7 +32,6 @@ class Sensor;
 namespace infinitesp {
 
 // Address constants
-static const uint8_t ADDR_DISCOVERY = 0x1F;
 static const uint8_t ADDR_THERMOSTAT = 0x20;
 static const uint8_t ADDR_INDOOR_UNIT = 0x40;
 static const uint8_t ADDR_OUTDOOR_UNIT = 0x50;
@@ -66,8 +65,6 @@ static const uint16_t REG_TSTAT_WIFI = 0x4608;          // SSID, password, hostn
 static const uint16_t REG_TSTAT_CLOUD = 0x4609;         // Cloud host, proxy server IP
 static const uint16_t REG_TSTAT_DEALER = 0x460A;        // Dealer name, brand, URL (120 bytes)
 static const uint16_t REG_TSTAT_FAULTS = 0x4202;        // Fault history (10 entries × 7 bytes = 70 bytes)
-static const uint16_t REG_TSTAT_WIFI_PROFILES = 0x460B; // WiFi profiles (4x 36 bytes)
-static const uint16_t REG_TSTAT_WIFI_SCAN = 0x460C;     // WiFi scan results (4x 36 bytes)
 
 // Comfort profile layout (register 400A, 35 bytes)
 // 5 activities × 7 bytes: [heat_sp(1), cool_sp(1), fan_mode(1), rclg_rhtg(1), hum_vent(1), unk5(1), unk6(1)]
@@ -207,6 +204,17 @@ struct InfinitESPFrame {
   std::vector<uint8_t> payload;
   uint16_t checksum;
 };
+
+// Fahrenheit → Celsius for an absolute temperature.
+static inline float f_to_c(float f) { return (f - 32.0f) * (5.0f / 9.0f); }
+// Celsius → Fahrenheit for an absolute temperature. NB: uses the
+// `c * (9/5) + 32` form (multiply by one rounded constant). Sites written as
+// `c * 9 / 5 + 32` are *not* bit-identical in float and must not be folded into
+// this helper.
+static inline float c_to_f(float c) { return c * (9.0f / 5.0f) + 32.0f; }
+// Fahrenheit → Celsius for a temperature *delta* (e.g. superheat/subcooling
+// spans): scale only, no 32° offset.
+static inline float f_to_c_delta(float f) { return f * (5.0f / 9.0f); }
 
 // Extract a null-terminated C string from a byte vector at the given offset
 static inline std::string extract_cstr(const std::vector<uint8_t> &data, size_t offset) {
@@ -685,6 +693,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   std::vector<uint8_t> rx_buffer_;
   std::vector<uint8_t> rx_hex_log_;
   std::vector<uint8_t> frame_body_;  // reusable buffer backing frame_payload_body_()
+  std::string hex_log_str_;          // reusable scratch for the idle RAW RX hex dump
   InfinitESPFrame current_frame_;
   std::vector<InfinitESPEntity *> entities_;
   uint8_t sam_address_{ADDR_FAKESAM};

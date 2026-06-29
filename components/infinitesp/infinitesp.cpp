@@ -173,17 +173,22 @@ void InfinitESPComponent::loop() {
     diag_inter_frame_max_ms_ = 0;
   }
 
-  // Flush raw hex log every 200ms of inactivity (DEBUG level to reduce overhead)
-  // Use heap-allocated string to avoid stack overflow with large bursts
+  // Flush raw hex log every 200ms of inactivity (VERBOSE level to reduce overhead).
+  // Format into a reusable member string (hex_log_str_): clear() keeps the
+  // capacity so this reuses its buffer across drains instead of allocating a
+  // fresh 1.5KB-capable string each time. A member rather than a stack buffer
+  // because rx_hex_log_ is capped at 512 bytes (→ up to 1536 hex chars), too
+  // large to want on the loop-task stack. Direct nibble formatting avoids a
+  // per-byte snprintf; output is identical to the old "%02X " form.
   if (!rx_hex_log_.empty() && (now - last_rx_time_ > 200)) {
-    std::string hex;
-    hex.reserve(rx_hex_log_.size() * 3);
-    for (size_t i = 0; i < rx_hex_log_.size(); i++) {
-      char tmp[4];
-      snprintf(tmp, sizeof(tmp), "%02X ", rx_hex_log_[i]);
-      hex.append(tmp);
+    static const char HEX_DIGITS[] = "0123456789ABCDEF";
+    hex_log_str_.clear();
+    for (uint8_t b : rx_hex_log_) {
+      hex_log_str_.push_back(HEX_DIGITS[b >> 4]);
+      hex_log_str_.push_back(HEX_DIGITS[b & 0x0F]);
+      hex_log_str_.push_back(' ');
     }
-    ESP_LOGV("InfinitESP", "RAW RX (%d bytes): %s", rx_hex_log_.size(), hex.c_str());
+    ESP_LOGV("InfinitESP", "RAW RX (%d bytes): %s", rx_hex_log_.size(), hex_log_str_.c_str());
     rx_hex_log_.clear();
   }
 
@@ -1629,38 +1634,38 @@ bool InfinitESPComponent::bus_uses_celsius() const {
 float InfinitESPComponent::bus_temp_to_celsius(float bus_value) const {
   if (bus_uses_celsius())
     return bus_value;  // already °C
-  return (bus_value - 32.0f) * (5.0f / 9.0f);  // °F → °C
+  return f_to_c(bus_value);
 }
 
 float InfinitESPComponent::celsius_to_bus_temp(float celsius) const {
   if (bus_uses_celsius())
     return celsius;  // bus wants °C
-  return celsius * (9.0f / 5.0f) + 32.0f;  // °C → °F
+  return c_to_f(celsius);
 }
 
 float InfinitESPComponent::comfort_byte_to_celsius(uint8_t raw) const {
   if (bus_uses_celsius())
     return (float) raw / 2.0f;  // half-degree °C
   // °F mode: raw is whole °F, convert to °C
-  return ((float) raw - 32.0f) * (5.0f / 9.0f);
+  return f_to_c((float) raw);
 }
 
 uint8_t InfinitESPComponent::celsius_to_comfort_byte(float celsius) const {
   if (bus_uses_celsius())
     return (uint8_t) roundf(celsius * 2.0f);  // °C → half-degree
-  return (uint8_t) roundf(celsius * (9.0f / 5.0f) + 32.0f);  // °C → °F
+  return (uint8_t) roundf(c_to_f(celsius));
 }
 
 float InfinitESPComponent::setpoint_to_celsius(uint8_t raw) const {
   if (bus_uses_celsius())
     return (float) raw;  // whole °C
-  return ((float) raw - 32.0f) * (5.0f / 9.0f);  // °F → °C
+  return f_to_c((float) raw);
 }
 
 uint8_t InfinitESPComponent::celsius_to_setpoint(float celsius) const {
   if (bus_uses_celsius())
     return (uint8_t) roundf(celsius);  // whole °C
-  return (uint8_t) roundf(celsius * (9.0f / 5.0f) + 32.0f);  // °C → °F
+  return (uint8_t) roundf(c_to_f(celsius));
 }
 
 void InfinitESPComponent::cache_wifi_credentials_(const std::string &ssid, const std::string &password) {

@@ -116,7 +116,7 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
             // holds its last sane value instead of publishing garbage. No
             // real refrigerant superheat/subcooling delta lands outside this
             // band; the corruption is orders of magnitude beyond it.
-            float celsius = fval * (5.0f / 9.0f);  // °F delta → °C delta (no -32 offset)
+            float celsius = f_to_c_delta(fval);  // °F delta → °C delta (no -32 offset)
             if (celsius >= ODU_DELTA_MIN_C && celsius <= ODU_DELTA_MAX_C)
               value = celsius;
           } else {
@@ -152,7 +152,7 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
         float f = t.guarded ? parent_->odu_status1_temp_f_(*data, t.idx)
                             : parent_->odu_status1_meas_f_(*data, t.idx);
         if (!std::isnan(f))
-          value = t.is_delta ? f * (5.0f / 9.0f) : (f - 32.0f) * (5.0f / 9.0f);
+          value = t.is_delta ? f_to_c_delta(f) : f_to_c(f);
         break;
       }
     }
@@ -164,24 +164,27 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     auto *data = parent_->get_register(device_addr, REG_ODU_SUPERHEAT);
     if (data) {
       float f = parent_->odu_suction_superheat_f_(*data);
-      if (!std::isnan(f)) value = f * (5.0f / 9.0f);
+      if (!std::isnan(f)) value = f_to_c_delta(f);
     }
   }
 
   // ODU inverter module temps from register 060A (data[110] PFCM, data[112] IPM;
   // u16 BE /16, native °F → °C). Cross-validated vs Anantha MQTT pfcm_temp/ipm_temp.
-  if (register_key == REG_ODU_FAN && sensor_type_ == "odu_ipm_temp") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
-    if (data) {
-      float f = parent_->odu_ipm_temp_f_(*data);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
-    }
-  }
-  if (register_key == REG_ODU_FAN && sensor_type_ == "odu_pfcm_temp") {
-    auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
-    if (data) {
-      float f = parent_->odu_pfcm_temp_f_(*data);
-      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
+  struct OduFanTemp { const char *type; float (*decode)(const std::vector<uint8_t> &); };
+  static const OduFanTemp odu_fan_temps[] = {
+    {"odu_ipm_temp",  InfinitESPComponent::odu_ipm_temp_f_},
+    {"odu_pfcm_temp", InfinitESPComponent::odu_pfcm_temp_f_},
+  };
+  if (register_key == REG_ODU_FAN) {
+    for (const auto &t : odu_fan_temps) {
+      if (sensor_type_ != t.type)
+        continue;
+      auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
+      if (data) {
+        float f = t.decode(*data);
+        if (!std::isnan(f)) value = f_to_c(f);
+      }
+      break;
     }
   }
 
@@ -193,7 +196,7 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
       uint8_t off_hi = 4 + (zone_ - 2) * 4 + 2;
       uint16_t raw = InfinitESPComponent::decode_u16_be_(*data, off_hi);
       float temp_f = (float) raw / ZC_TEMP_SCALE;
-      value = (temp_f - 32.0f) * (5.0f / 9.0f);  // °F → °C for HA
+      value = f_to_c(temp_f);  // °F → °C for HA
     }
   }
 
