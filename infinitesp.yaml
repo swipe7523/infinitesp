@@ -386,6 +386,36 @@ sensor:
     icon: "mdi:thermometer"
     entity_category: diagnostic
 
+  # Outdoor unit - compressor inverter telemetry (register 060a, vs Anantha MQTT)
+  - platform: infinitesp
+    infinitesp_id: infinitesp_hub
+    name: "ODU DC Bus Voltage"
+    type: odu_dc_bus_voltage
+    accuracy_decimals: 0
+    icon: "mdi:flash"
+    entity_category: diagnostic
+  - platform: infinitesp
+    infinitesp_id: infinitesp_hub
+    name: "ODU AC Line Current"
+    type: odu_ac_line_current
+    accuracy_decimals: 2
+    icon: "mdi:current-ac"
+    entity_category: diagnostic
+  - platform: infinitesp
+    infinitesp_id: infinitesp_hub
+    name: "ODU IPM Temp"
+    type: odu_ipm_temp
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+    entity_category: diagnostic
+  - platform: infinitesp
+    infinitesp_id: infinitesp_hub
+    name: "ODU PFCM Temp"
+    type: odu_pfcm_temp
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+    entity_category: diagnostic
+
   # Vacation limits
   - platform: infinitesp
     infinitesp_id: infinitesp_hub

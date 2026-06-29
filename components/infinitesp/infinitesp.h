@@ -503,6 +503,42 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     if (data.size() < 66) return NAN;
     return (float) decode_u16_be_(data, 64);
   }
+  // ODU register 060A (REG_ODU_FAN) also carries the compressor-inverter
+  // telemetry block. Offsets/scales reverse-engineered over a 24h heat+cool
+  // capture using the OFF->HIGH endpoint discriminator (a field's raw value at
+  // settled compressor-OFF, where loads are NOT collinear, plus a non-monotonic
+  // OFF/MID/HIGH match) and cross-validated against the thermostat's independent
+  // MQTT stream (Anantha fork: dc_bus_voltage/ipm_temp/pfcm_temp/ac_line_current,
+  // units confirmed there). Each is plausibility-guarded per the repo's
+  // reject-bad-data convention. EXV position also lives in 060A but is not yet
+  // localized (pinned 0/100% in the available capture); see TODO.md.
+  //   data[98]  DC-bus voltage  u16 BE / 16  (V)
+  //   data[102] AC line current u16 BE / 256 (A)
+  //   data[110] PFCM temp       u16 BE / 16  (native °F)
+  //   data[112] IPM temp        u16 BE / 16  (native °F)
+  static float odu_dc_bus_voltage_(const std::vector<uint8_t> &data) {
+    if (data.size() < 100) return NAN;
+    float v = (float) decode_u16_be_(data, 98) / 16.0f;
+    return (v >= 0.0f && v <= 600.0f) ? v : NAN;  // ~410 VDC nominal inverter bus
+  }
+  static float odu_ac_line_current_(const std::vector<uint8_t> &data) {
+    if (data.size() < 104) return NAN;
+    float a = (float) decode_u16_be_(data, 102) / 256.0f;
+    return (a >= 0.0f && a <= 60.0f) ? a : NAN;  // residential ODU line current
+  }
+  // PFCM/IPM module temps, native °F (caller converts °F→°C). Generous power-
+  // module band: real readings ~55–155 °F, garbage from a wrong-state field is
+  // orders of magnitude out.
+  static float odu_pfcm_temp_f_(const std::vector<uint8_t> &data) {
+    if (data.size() < 112) return NAN;
+    float f = (float) decode_u16_be_(data, 110) / 16.0f;
+    return (f >= -40.0f && f <= 300.0f) ? f : NAN;
+  }
+  static float odu_ipm_temp_f_(const std::vector<uint8_t> &data) {
+    if (data.size() < 114) return NAN;
+    float f = (float) decode_u16_be_(data, 112) / 16.0f;
+    return (f >= -40.0f && f <= 300.0f) ? f : NAN;
+  }
   // ODU register 0613 (REG_ODU_SUPERHEAT): LIVE suction superheat, float32 BE at
   // data[52], native °F delta. Confirmed vs Anantha suction_superheat (20.41→21.63
   // tracked 20.33→21.43). Supersedes the 061F idx2 "superheat actual", which is a

@@ -77,6 +77,8 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     {"odu_line_voltage",       REG_ODU_STATUS3,    InfinitESPComponent::odu_line_voltage_},
     {"odu_operating_mode",     REG_ODU_STATUS3,    InfinitESPComponent::odu_operating_mode_},
     {"odu_fan_rpm",            REG_ODU_FAN,        InfinitESPComponent::odu_outdoor_fan_rpm_},
+    {"odu_dc_bus_voltage",     REG_ODU_FAN,        InfinitESPComponent::odu_dc_bus_voltage_},
+    {"odu_ac_line_current",    REG_ODU_FAN,        InfinitESPComponent::odu_ac_line_current_},
     {"odu_suction_pressure",   REG_ODU_STATUS2,    InfinitESPComponent::odu_suction_pressure_psig_},
     {"odu_discharge_pressure", REG_ODU_STATUS2,    InfinitESPComponent::odu_discharge_pressure_psig_},
     {"odu_power",              REG_ODU_POWER,      InfinitESPComponent::odu_power_w_},
@@ -163,6 +165,23 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
     if (data) {
       float f = parent_->odu_suction_superheat_f_(*data);
       if (!std::isnan(f)) value = f * (5.0f / 9.0f);
+    }
+  }
+
+  // ODU inverter module temps from register 060A (data[110] PFCM, data[112] IPM;
+  // u16 BE /16, native °F → °C). Cross-validated vs Anantha MQTT pfcm_temp/ipm_temp.
+  if (register_key == REG_ODU_FAN && sensor_type_ == "odu_ipm_temp") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
+    if (data) {
+      float f = parent_->odu_ipm_temp_f_(*data);
+      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
+    }
+  }
+  if (register_key == REG_ODU_FAN && sensor_type_ == "odu_pfcm_temp") {
+    auto *data = parent_->get_register(device_addr, REG_ODU_FAN);
+    if (data) {
+      float f = parent_->odu_pfcm_temp_f_(*data);
+      if (!std::isnan(f)) value = (f - 32.0f) * (5.0f / 9.0f);
     }
   }
 

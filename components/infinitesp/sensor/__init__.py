@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import sensor
-from esphome.const import CONF_ID, CONF_TYPE, STATE_CLASS_MEASUREMENT, DEVICE_CLASS_TEMPERATURE, DEVICE_CLASS_VOLTAGE, DEVICE_CLASS_PRESSURE, DEVICE_CLASS_POWER
+from esphome.const import CONF_ID, CONF_TYPE, STATE_CLASS_MEASUREMENT, DEVICE_CLASS_TEMPERATURE, DEVICE_CLASS_VOLTAGE, DEVICE_CLASS_PRESSURE, DEVICE_CLASS_POWER, DEVICE_CLASS_CURRENT
 from .. import InfinitESPEntity, CONF_INFINITESP_ID, infinitesp_ns, register_infinitesp_entity
 
 CONF_ZONE = "zone"
@@ -28,6 +28,12 @@ SENSOR_TYPES = {
     "odu_line_voltage": {"key": "odu_line_voltage", "unit": "V", "device_class": DEVICE_CLASS_VOLTAGE, "bus_class": 5},
     # ODU outdoor fan RPM from register 060a data[64] (confirmed vs Anantha MQTT)
     "odu_fan_rpm": {"key": "odu_fan_rpm", "unit": "RPM", "bus_class": 5},
+    # ODU compressor-inverter telemetry from register 060a (confirmed vs Anantha MQTT
+    # over a 24h capture via the OFF→HIGH endpoint discriminator; units per Anantha registry)
+    "odu_dc_bus_voltage": {"key": "odu_dc_bus_voltage", "unit": "V", "device_class": DEVICE_CLASS_VOLTAGE, "bus_class": 5},
+    "odu_ac_line_current": {"key": "odu_ac_line_current", "unit": "A", "device_class": DEVICE_CLASS_CURRENT, "bus_class": 5},
+    "odu_ipm_temp": {"key": "odu_ipm_temp", "unit": "°C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    "odu_pfcm_temp": {"key": "odu_pfcm_temp", "unit": "°C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     # ODU live suction superheat from register 0613 data[52] float32 (\u00b0F\u2192\u00b0C delta).
     # The correct live value; 061f idx2 below is a STATIC target, kept for reference.
     "odu_suction_superheat": {"key": "odu_suction_superheat", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
