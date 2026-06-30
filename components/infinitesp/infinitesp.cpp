@@ -1865,7 +1865,24 @@ void InfinitESPComponent::update_status_led_() {
 void InfinitESPComponent::log_traffic_(uint8_t src, uint8_t dst, uint8_t func, uint16_t reg_key,
                                          const std::vector<uint8_t> &payload) {
   TrafficKey key{src, dst, func, reg_key};
-  auto &entry = traffic_log_[key];
+  auto it = traffic_log_.find(key);
+  if (it == traffic_log_.end()) {
+    // New key. Bound the distinct-key count to TRAFFIC_LOG_MAX by evicting the
+    // least-recently-seen entry first, so the map can't grow without limit over
+    // a long uptime. The scan is O(n) but only runs when inserting a brand-new
+    // key at capacity — which never happens in normal operation, where the
+    // distinct-tuple count stays well under the cap. last_payload copy-assigns
+    // below, reusing the destination's capacity.
+    if (traffic_log_.size() >= TRAFFIC_LOG_MAX) {
+      auto oldest = traffic_log_.begin();
+      for (auto i = traffic_log_.begin(); i != traffic_log_.end(); ++i)
+        if (i->second.last_seen_ms < oldest->second.last_seen_ms)
+          oldest = i;
+      traffic_log_.erase(oldest);
+    }
+    it = traffic_log_.emplace(key, TrafficEntry{}).first;
+  }
+  auto &entry = it->second;
   entry.count++;
   entry.last_payload = payload;
   entry.last_seen_ms = millis();

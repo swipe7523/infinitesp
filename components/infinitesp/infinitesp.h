@@ -672,6 +672,12 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     }
   };
   std::map<TrafficKey, TrafficEntry> traffic_log_;
+  // Upper bound on distinct traffic-log keys. A fixed installation produces far
+  // fewer distinct (src,dst,func,reg) tuples than this, so the cap never engages
+  // in normal operation; it only bounds pathological growth (e.g. bus corruption
+  // minting novel keys over a long uptime). When exceeded, log_traffic_ evicts
+  // the least-recently-seen entry.
+  static const size_t TRAFFIC_LOG_MAX = 256;
   void log_traffic_(uint8_t src, uint8_t dst, uint8_t func, uint16_t reg_key,
                      const std::vector<uint8_t> &payload);
 
