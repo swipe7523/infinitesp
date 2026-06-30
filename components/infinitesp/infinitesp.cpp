@@ -640,8 +640,9 @@ void InfinitESPComponent::handle_passive_frame_() {
       // variable-speed equipment (issue #7); the climate component caches it.
       if (reg_key == REG_ODU_RUN_STATUS && data.size() >= 1) {
         uint8_t dir = data[0] & 0x0F;
-        ESP_LOGD("InfinitESP", "ODU 0602: direction=%s raw_byte0=%02X",
+        ESP_LOGD("InfinitESP", "ODU 0602: direction=%s%s raw_byte0=%02X",
                  dir == ODU_RUN_HEAT ? "HEAT" : dir == ODU_RUN_COOL ? "COOL" : "idle/unknown",
+                 (data[0] & ODU_RUN_TRANSIENT) ? " (transient, ignored)" : "",
                  data[0]);
       }
 

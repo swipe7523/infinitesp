@@ -185,6 +185,10 @@ static const uint16_t REG_ODU_POWER = 0x0625;      // Inverter/compressor input 
 // REG_ODU_RUN_STATUS (0x0602) byte0 low-nibble values, confirmed by heat-vs-cool bus diff.
 static const uint8_t ODU_RUN_COOL = 2;
 static const uint8_t ODU_RUN_HEAT = 3;
+// byte0 bit 0x10 flags a transient/unsettled reading: during a steady cycle the ODU
+// intermittently emits the OPPOSITE direction with this bit set (e.g. 0x53 = heat +
+// transient mid-cooling). Only the steady frames (bit clear) carry the true direction.
+static const uint8_t ODU_RUN_TRANSIENT = 0x10;
 
 // Frame constants
 static const uint8_t FRAME_HEADER_SIZE = 8;

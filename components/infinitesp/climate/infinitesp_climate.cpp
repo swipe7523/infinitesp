@@ -222,69 +222,56 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
       }
 
       uint8_t stagmode = data->at(REG3B02_STAGMODE);
-      uint8_t mode = stagmode & 0x0F;
-      uint8_t stage = (stagmode >> 4) & 0x0F;
+      // 0xFF is the same warmup sentinel the zone-temp fields guard above. Decoding
+      // it raw gives stage=15 / mode=15, which falls through the mode switch to
+      // CLIMATE_MODE_OFF and gets latched as a phantom "Off". Drop the whole
+      // stage/mode update for a sentinel frame and hold the last good values.
+      if (stagmode != 0xFF) {
+        uint8_t mode = stagmode & 0x0F;
+        uint8_t stage = (stagmode >> 4) & 0x0F;
 
-      // Cache the raw stage/mode nibbles so action can be recomputed when a
-      // ZC damper update arrives without a new 3B02 frame. During stage>0 the
-      // mode nibble reflects direction (heat/cool); at stage==0 it holds the
-      // requested mode and action is IDLE regardless.
-      last_stage_ = stage;
-      last_mode_ = mode;
-      // Invalidate the cached ODU direction when the system goes idle. last_odu_dir_
-      // only refreshes when a 0602 frame arrives, but 0602 is polled far less often
-      // than 3B02 updates. Without this, a new cycle (stage 0→>0 in AUTO) inherits the
-      // PREVIOUS cycle's direction and briefly shows e.g. Heating while actually
-      // Cooling, until the next 0602 lands. Clearing on idle makes a fresh cycle show
-      // IDLE (action requires stage>0 anyway) until the real direction is confirmed —
-      // briefly idle beats confidently wrong.
-      if (stage == 0)
-        last_odu_dir_ = 0;
-      // AUTO during stage>0 is normal: variable-speed equipment leaves the 3B02
-      // mode nibble at AUTO during active operation (issue #7). Direction is
-      // resolved independently from the ODU 0602 run-status register, so this
-      // case no longer warrants a warning.
-      if (compute_action_())
-        changed = true;
+        // Cache the raw stage/mode nibbles so action can be recomputed when a ZC
+        // damper update arrives without a new 3B02 frame.
+        last_stage_ = stage;
+        last_mode_ = mode;
+        // Invalidate the cached ODU direction when the system goes idle. last_odu_dir_
+        // only refreshes when a 0602 frame arrives, far less often than 3B02 updates.
+        // Without this, a new cycle (stage 0→>0 in AUTO) inherits the PREVIOUS cycle's
+        // direction and briefly shows e.g. Heating while actually Cooling. Clearing on
+        // idle makes a fresh cycle show IDLE until the real direction is confirmed.
+        if (stage == 0)
+          last_odu_dir_ = 0;
+        if (compute_action_())
+          changed = true;
 
-      // Mode update logic:
-      // - When stage==0 (idle): mode nibble is the true requested mode. Always trust it.
-      // - When stage>0 (active): mode nibble shows active direction (heat/cool) even if
-      //   the requested mode is AUTO. So only trust it for non-AUTO modes.
-      //   On first boot (sys_mode_==0xFF), accept any reading to avoid staying stuck
-      //   at CLIMATE_MODE_OFF.
-      bool can_update_mode = false;
-      if (stage == 0) {
-        can_update_mode = true;
-      } else if (mode != SYSMODE_AUTO && mode != SYSMODE_EHEAT) {
-        // Actively heating or cooling — mode nibble is correct for heat/cool/off.
-        // Don't update from AUTO (stage>0 can't be AUTO on the bus anyway).
-        can_update_mode = true;
-      }
-      // On first boot, accept any mode reading to unstick from OFF
-      if (!can_update_mode && sys_mode_ == 0xFF)
-        can_update_mode = true;
-
-      if (can_update_mode && mode != sys_mode_) {
-        sys_mode_ = mode;
-        switch (mode) {
-          case SYSMODE_HEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
-          case SYSMODE_COOL: this->mode = climate::CLIMATE_MODE_COOL; break;
-          case SYSMODE_AUTO: this->mode = climate::CLIMATE_MODE_HEAT_COOL; break;
-          case SYSMODE_EHEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
-          case SYSMODE_OFF:
-          default: this->mode = climate::CLIMATE_MODE_OFF; break;
+        // The 3B02 mode nibble is the requested system mode at EVERY stage on this
+        // variable-speed equipment: it stays AUTO even while actively cooling, with
+        // direction resolved separately from the ODU 0602 register (issue #7). So
+        // trust any in-range reading directly — including AUTO during stage>0, which
+        // the old logic skipped, leaving a stale mode (e.g. a sentinel-induced "Off")
+        // stuck until the system next idled. Reject out-of-range nibbles rather than
+        // mapping them to OFF.
+        if (mode <= SYSMODE_OFF && mode != sys_mode_) {
+          sys_mode_ = mode;
+          switch (mode) {
+            case SYSMODE_HEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
+            case SYSMODE_COOL: this->mode = climate::CLIMATE_MODE_COOL; break;
+            case SYSMODE_AUTO: this->mode = climate::CLIMATE_MODE_HEAT_COOL; break;
+            case SYSMODE_EHEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
+            case SYSMODE_OFF:
+            default: this->mode = climate::CLIMATE_MODE_OFF; break;
+          }
+          // Update setpoints based on mode: single target for heat/cool, dual for heat_cool
+          float heat_c = parent_->setpoint_to_celsius(heat_sp_);
+          float cool_c = parent_->setpoint_to_celsius(cool_sp_);
+          this->target_temperature_low = heat_c;
+          this->target_temperature_high = cool_c;
+          if (this->mode == climate::CLIMATE_MODE_HEAT)
+            this->target_temperature = heat_c;
+          else if (this->mode == climate::CLIMATE_MODE_COOL)
+            this->target_temperature = cool_c;
+          changed = true;
         }
-        // Update setpoints based on mode: single target for heat/cool, dual for heat_cool
-        float heat_c = parent_->setpoint_to_celsius(heat_sp_);
-        float cool_c = parent_->setpoint_to_celsius(cool_sp_);
-        this->target_temperature_low = heat_c;
-        this->target_temperature_high = cool_c;
-        if (this->mode == climate::CLIMATE_MODE_HEAT)
-          this->target_temperature = heat_c;
-        else if (this->mode == climate::CLIMATE_MODE_COOL)
-          this->target_temperature = cool_c;
-        changed = true;
       }
     }
   }
@@ -296,11 +283,19 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
   if (register_key == REG_ODU_RUN_STATUS) {
     auto *data = parent_->get_register(device_addr, REG_ODU_RUN_STATUS);
     if (data && !data->empty()) {
-      uint8_t dir = data->at(0) & 0x0F;
-      if (dir != last_odu_dir_) {
-        last_odu_dir_ = dir;
-        if (compute_action_())
-          changed = true;
+      uint8_t raw = data->at(0);
+      // Skip transient frames (0x10 set): during a steady cycle the ODU
+      // intermittently reports the opposite direction with this bit set
+      // (e.g. 0x53 = heat+transient seen mid-cooling), which would flap the
+      // action to Heating until the next steady frame corrects it. Steady
+      // frames (0x42/0x43) are always consistent with the real cycle.
+      if (!(raw & ODU_RUN_TRANSIENT)) {
+        uint8_t dir = raw & 0x0F;
+        if (dir != last_odu_dir_) {
+          last_odu_dir_ = dir;
+          if (compute_action_())
+            changed = true;
+        }
       }
     }
   }
