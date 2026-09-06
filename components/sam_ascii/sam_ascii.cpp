@@ -59,7 +59,7 @@ void SamAsciiComponent::loop() {
           "|_   _|     / _(_)     (_) | |  ___/  ___| ___ \\ /  ___|/ _ \\ |  \\/  |\r\n"
           "  | | _ __ | |_ _ _ __  _| |_| |__ \\ `--.| |_/ / \\ `--./ /_\\ \\| .  . |\r\n"
           "  | || '_ \\|  _| | '_ \\| | __|  __| `--. \\  __/   `--. \\  _  || |\\/| |\r\n"
-          " _| || | | | | | | | | | | |_| |___/\__/ / |     /\__/ / | | || |  | |\r\n"
+          " _| || | | | | | | | | | | |_| |___/\\__/ / |     /\\__/ / | | || |  | |\r\n"
           " \\___/_| |_|_| |_|_| |_|_|\\__\\____/\\____/\\_|     \\____/\\_| |_/\\_|  |_/\r\n");
       flush();
       banner_sent_ = true;
@@ -159,7 +159,10 @@ void SamAsciiComponent::process_line_(const std::string &line) {
   // HELP anywhere in the command triggers help response (works even with bus offline)
   if (cmd.find("HELP") != std::string::npos) {
     respond_(prefix, "COMMANDS: MODE RT RH HTSP CLSP FAN HOLD OAT TIME DAY ZONE NAME BLIGHT CFGEM REPORT");
-    respond_(prefix, "SET: MODE!<mode> Z#HTSP!<temp> Z#CLSP!<temp> Z#FAN!<mode> Z#HOLD!<on|off|minutes>");
+    respond_(prefix, "ZONE: Z#RT Z#RH Z#HTSP Z#CLSP Z#FAN Z#HOLD Z#UNOCC Z#RHTG Z#OVR Z#OTMR Z#NAME");
+    respond_(prefix, "ACCESSORY: FILTRLVL UVLVL HUMLVL VENTLVL FILTRRMD UVRMD HUMRMD VENTRMD");
+    respond_(prefix, "VACATION: VACAT VACDAYS VACMINT VACMAXT VACMINH VACMAXH VACFAN  CONFIG: CFGDEAD CFGCPH CFGPER CFGPGM DEALER DEALERPH");
+    respond_(prefix, "SET: MODE!<mode> Z#HTSP!<temp> Z#CLSP!<temp> Z#FAN!<mode> Z#HOLD!<on|off|minutes> VACDAYS!<days> VACMINT!<temp> VACMAXT!<temp> VACFAN!<mode>");
     return;
   }
 
@@ -204,7 +207,9 @@ void SamAsciiComponent::process_line_(const std::string &line) {
   // Get register data pointers (SAM registers stored under SAM address)
   auto *state = parent_->get_register(parent_->get_sam_address(), REG_SAM_STATE);     // 3B02
   auto *zones_data = parent_->get_register(parent_->get_sam_address(), REG_SAM_ZONES);      // 3B03
+  auto *accessories = parent_->get_register(parent_->get_sam_address(), REG_SAM_ACCESSORIES);  // 3B05
   auto *dealer = parent_->get_register(parent_->get_sam_address(), REG_SAM_DEALER);    // 3B06
+  // (3B04 vacation is not a cached register — see vacation_* getters below.)
 
   // ---- Write commands (! separator) ----
   size_t bang = body.find('!');
@@ -258,6 +263,41 @@ void SamAsciiComponent::process_line_(const std::string &line) {
         if (minutes <= 0) { respond_nak_(prefix, "VAL"); return; }
         parent_->set_zone_hold(zone, (uint16_t) minutes);
       }
+      respond_(prefix, "ACK");
+      return;
+    }
+
+    // ---- Vacation writes (3B04) ----
+    if (write_cmd == "VACDAYS") {
+      int days = atoi(write_val.c_str());
+      if (days < 0 || days > 365) { respond_nak_(prefix, "VAL"); return; }
+      parent_->set_vacation_days((uint16_t) days);
+      respond_(prefix, "ACK");
+      return;
+    }
+    if (write_cmd == "VACMINT" || write_cmd == "VACMAXT") {
+      int t = atoi(write_val.c_str());
+      int lo = parent_->bus_uses_celsius() ? 4 : 40;
+      int hi = parent_->bus_uses_celsius() ? 37 : 99;
+      if (t < lo || t > hi) { respond_nak_(prefix, "VAL"); return; }
+      parent_->set_vacation_temp(write_cmd == "VACMINT", (uint8_t) t);
+      respond_(prefix, "ACK");
+      return;
+    }
+    if (write_cmd == "VACMINH" || write_cmd == "VACMAXH") {
+      int h = atoi(write_val.c_str());
+      if (h < 0 || h > 100) { respond_nak_(prefix, "VAL"); return; }
+      parent_->set_vacation_humidity(write_cmd == "VACMINH", (uint8_t) h);
+      respond_(prefix, "ACK");
+      return;
+    }
+    if (write_cmd == "VACFAN") {
+      uint8_t fan = 0xFF;
+      for (uint8_t i = 0; i < FAN_COUNT; i++) {
+        if (write_val == FAN_NAMES[i]) { fan = i; break; }
+      }
+      if (fan == 0xFF) { respond_nak_(prefix, "VAL"); return; }
+      parent_->set_vacation_fan(fan);
       respond_(prefix, "ACK");
       return;
     }
@@ -408,6 +448,44 @@ void SamAsciiComponent::process_line_(const std::string &line) {
     }
     respond_(prefix, name.empty() ? ("Zone " + std::to_string(zone)) : name);
 
+  // ---- Zone read commands (3B02 / 3B03) ----
+  // 3B02 byte 21 zones_unoccupied bitmask: bit (zone-1) set = unoccupied.
+  } else if (body == "UNOCC") {
+    if (!state || state->size() <= REG3B02_UNOCCUPIED) {
+      respond_nak_(prefix, "");
+      return;
+    }
+    respond_(prefix, ((*state)[REG3B02_UNOCCUPIED] & (1 << idx)) ? "ON" : "OFF");
+
+  // 3B03 byte 28+idx humidity_setpoint (humidification target, %).
+  } else if (body == "RHTG") {
+    if (!zones_data || zones_data->size() <= REG3B03_HUMIDITY_SETPOINTS + idx) {
+      respond_nak_(prefix, "");
+      return;
+    }
+    respond_(prefix, std::to_string((*zones_data)[REG3B03_HUMIDITY_SETPOINTS + idx]) + "%");
+
+  // Override state: a finite ("hold until") timer is active for this zone.
+  // get_zone_hold_duration() returns HOLD_PERMANENT for permanent holds, so a
+  // finite value >0 means a timed override is running. (Spec: Touch OVR == the
+  // "hold until" timer.)
+  } else if (body == "OVR") {
+    uint16_t dur = parent_->get_zone_hold_duration(zone);
+    respond_(prefix, (dur > 0 && dur != InfinitESPComponent::HOLD_PERMANENT) ? "ON" : "OFF");
+
+  // Override timer remaining as HH:MM. hold_duration is the set duration in
+  // minutes (the thermostat, not InfinitESP, counts it down), so this reports
+  // the configured duration rather than a live decrementing value.
+  } else if (body == "OTMR") {
+    uint16_t dur = parent_->get_zone_hold_duration(zone);
+    if (dur == 0 || dur == InfinitESPComponent::HOLD_PERMANENT) {
+      respond_(prefix, "00:00");
+    } else {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%02d:%02d", dur / 60, dur % 60);
+      respond_(prefix, buf);
+    }
+
   } else if (body == "BLIGHT") {
     if (!dealer || dealer->empty()) {
       respond_nak_(prefix, "");
@@ -417,6 +495,65 @@ void SamAsciiComponent::process_line_(const std::string &line) {
 
   } else if (body == "CFGEM") {
     respond_(prefix, parent_->bus_uses_celsius() ? "C" : "F");
+
+  // ---- Accessory life & reminders (3B05) ----
+  // Values are consumption % (0=new, 100=replace); reminder bytes are 0/1.
+  } else if (body == "FILTRLVL" || body == "UVLVL" || body == "HUMLVL" || body == "VENTLVL") {
+    uint8_t off = (body == "FILTRLVL") ? REG3B05_FILTER : (body == "UVLVL") ? REG3B05_UV :
+                  (body == "HUMLVL") ? REG3B05_HUMIDIFIER : REG3B05_VENTILATOR;
+    if (!accessories || accessories->size() <= off) { respond_nak_(prefix, ""); return; }
+    respond_(prefix, std::to_string((*accessories)[off]) + "%");
+  } else if (body == "FILTRRMD" || body == "UVRMD" || body == "HUMRMD" || body == "VENTRMD") {
+    uint8_t off = (body == "FILTRRMD") ? REG3B05_FILTER_RMD : (body == "UVRMD") ? REG3B05_UV_RMD :
+                  (body == "HUMRMD") ? REG3B05_HUMIDIFIER_RMD : REG3B05_VENTILATOR_RMD;
+    if (!accessories || accessories->size() <= off) { respond_nak_(prefix, ""); return; }
+    respond_(prefix, (*accessories)[off] ? "ON" : "OFF");
+
+  // ---- Vacation ----
+  // Config lives in InfinitESP vacation_* members and is pushed to the
+  // thermostat as SAM.0x3B04 change-frames (see REG3B04_FLAG_* in the header).
+  // VACAT is derived from days-remaining (>0 = active).
+  } else if (body == "VACAT") {
+    respond_(prefix, parent_->get_vacation_days() > 0 ? "ON" : "OFF");
+  } else if (body == "VACDAYS") {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%03u", parent_->get_vacation_days());
+    respond_(prefix, buf);
+  } else if (body == "VACMINT" || body == "VACMAXT") {
+    uint8_t t = (body == "VACMINT") ? parent_->get_vacation_min_temp() : parent_->get_vacation_max_temp();
+    respond_(prefix, format_temp_(t));
+  } else if (body == "VACMINH" || body == "VACMAXH") {
+    uint8_t h = (body == "VACMINH") ? parent_->get_vacation_min_humidity() : parent_->get_vacation_max_humidity();
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%03d%%", h);
+    respond_(prefix, buf);
+  } else if (body == "VACFAN") {
+    uint8_t fan = parent_->get_vacation_fan();
+    respond_(prefix, (fan < FAN_COUNT) ? FAN_NAMES[fan] : "UNKNOWN");
+
+  // ---- Configuration (3B06) ----
+  // CFGAUTO is not served: no auto_mode field is confirmed in the current 3B06
+  // guess (byte 1 is the live-confirmed metric_units flag, leaving no room for
+  // an auto_mode byte there).
+  } else if (body == "CFGDEAD" || body == "CFGCPH" || body == "CFGPER") {
+    uint8_t off = (body == "CFGDEAD") ? REG3B06_DEADBAND : (body == "CFGCPH") ?
+                  REG3B06_CYCLES_PER_HOUR : REG3B06_SCHEDULE_PERIODS;
+    if (!dealer || dealer->size() <= off) { respond_nak_(prefix, ""); return; }
+    respond_(prefix, std::to_string((*dealer)[off]));
+  } else if (body == "CFGPGM") {
+    if (!dealer || dealer->size() <= REG3B06_PROGRAMS_ENABLED) { respond_nak_(prefix, ""); return; }
+    respond_(prefix, (*dealer)[REG3B06_PROGRAMS_ENABLED] ? "ON" : "OFF");
+  } else if (body == "DEALER" || body == "DEALERPH") {
+    uint8_t off = (body == "DEALER") ? REG3B06_DEALER_NAME : REG3B06_DEALER_PHONE;
+    if (!dealer || dealer->size() < off + 20) { respond_nak_(prefix, ""); return; }
+    std::string s;
+    for (size_t i = 0; i < 20; i++) {
+      char c = (char) (*dealer)[off + i];
+      if (c == 0) break;
+      s += c;
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    respond_(prefix, s);
 
   } else {
     // Unknown command

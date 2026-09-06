@@ -1,26 +1,88 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
+import logging
 from esphome.components import sensor
-from esphome.const import CONF_ID, CONF_TYPE, STATE_CLASS_MEASUREMENT, DEVICE_CLASS_TEMPERATURE, DEVICE_CLASS_VOLTAGE, DEVICE_CLASS_PRESSURE, DEVICE_CLASS_POWER, DEVICE_CLASS_CURRENT
+from esphome.const import (
+    CONF_ID,
+    CONF_TYPE,
+    CONF_DISABLED_BY_DEFAULT,
+    CONF_ACCURACY_DECIMALS,
+    CONF_STATE_CLASS,
+    STATE_CLASS_MEASUREMENT,
+    STATE_CLASS_NONE,
+    STATE_CLASS_TOTAL_INCREASING,
+    DEVICE_CLASS_TEMPERATURE,
+    DEVICE_CLASS_HUMIDITY,
+    DEVICE_CLASS_VOLUME_FLOW_RATE,
+    DEVICE_CLASS_VOLTAGE,
+    DEVICE_CLASS_CURRENT,
+    DEVICE_CLASS_PRESSURE,
+    DEVICE_CLASS_POWER,
+    DEVICE_CLASS_DURATION,
+    DEVICE_CLASS_TIMESTAMP,
+)
+from esphome.components import time
 from .. import InfinitESPEntity, CONF_INFINITESP_ID, infinitesp_ns, register_infinitesp_entity
 
 CONF_ZONE = "zone"
+CONF_TIME_ID = "time_id"
+
+# raw_register (generic bus-field sensor) config keys and datatypes.
+CONF_DEVICE_ADDRESS = "device_address"
+CONF_REGISTER = "register"
+CONF_OFFSET = "offset"
+CONF_DATATYPE = "datatype"
+CONF_SCALE = "scale"
+CONF_VALUE_MIN = "value_min"
+CONF_VALUE_MAX = "value_max"
+CONF_LAMBDA = "lambda"
+RAW_DATATYPES = ["uint8", "int8", "uint16_be", "int16_be", "uint32_be", "int32_be", "f32_be"]
 
 InfinitESPSensor = infinitesp_ns.class_("InfinitESPSensor", sensor.Sensor, InfinitESPEntity)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Deprecated sensor type aliases: old yaml key -> replacement.
+DEPRECATED_SENSOR_TYPES = {
+    "compressor_frequency": "odu_requested_cfm",
+}
+
+# Monotonic counters (register 0310 cycles / 0311 hours): state_class=total_increasing
+# so HA treats them as utility-meter-able totals (not stair-step measurement graphs),
+# with integer precision.
+_HOURS = {"unit": "h", "device_class": DEVICE_CLASS_DURATION,
+          "state_class": STATE_CLASS_TOTAL_INCREASING, "accuracy_decimals": 0}
+_CYCLES = {"unit": "cycles", "state_class": STATE_CLASS_TOTAL_INCREASING, "accuracy_decimals": 0}
 
 SENSOR_TYPES = {
     # SAM/thermostat sensors — device_class 0 (any), they gate on register_key
     "temperature": {"key": "temperature", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 0},
-    "humidity": {"key": "humidity", "unit": "%", "bus_class": 0},
+    "humidity": {"key": "humidity", "unit": "%", "device_class": DEVICE_CLASS_HUMIDITY, "bus_class": 0},
     "outdoor_temperature": {"key": "outdoor_temperature", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 0},
     "vacation_min_temp": {"key": "vacation_min_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 0},
     "vacation_max_temp": {"key": "vacation_max_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 0},
     # IDU sensors — device class 4
     "blower_rpm": {"key": "blower_rpm", "unit": "RPM", "bus_class": 4},
-    "airflow_cfm": {"key": "airflow_cfm", "unit": "CFM", "bus_class": 4},
+    "airflow_cfm": {"key": "airflow_cfm", "unit": "ft³/min", "device_class": DEVICE_CLASS_VOLUME_FLOW_RATE, "bus_class": 4},
     # ODU sensors — device class 5
+    # bare = actual (measured) RPM [2..3] (the original `compressor_rpm` read
+    # [0..1] = target; re-pointed to actual). target_compressor_rpm [0..1] is
+    # additive. Infinitude OutdoorUnit.pm 0604: target_rpm / current_rpm.
     "compressor_rpm": {"key": "compressor_rpm", "unit": "RPM", "bus_class": 5},
-    "compressor_frequency": {"key": "compressor_frequency", "unit": "Hz", "bus_class": 5},
+    "target_compressor_rpm": {"key": "target_compressor_rpm", "unit": "RPM", "bus_class": 5},
+    # ODU register 0608 bytes [5..6]: airflow (CFM) the ODU requests from the
+    # IDU while running. 'compressor_frequency' is the deprecated old name for
+    # the same field: on a 4-ton 24VNA9 the values fit both decodes (1440 =
+    # 144.0 Hz = 4320 rpm on a 4-pole motor, and 1440 CFM at ~360/ton), but
+    # issue #7 cross-model data (display-confirmed CFM, 2-ton values) rules
+    # out frequency.
+    "odu_requested_cfm": {"key": "odu_requested_cfm", "unit": "ft³/min", "device_class": DEVICE_CLASS_VOLUME_FLOW_RATE, "bus_class": 5, "accuracy_decimals": 0},
+    # Deprecated alias for odu_requested_cfm. Warns at validation, decodes
+    # identically (same key), publishes the corrected CFM unit.
+    "compressor_frequency": {"key": "odu_requested_cfm", "unit": "ft³/min", "device_class": DEVICE_CLASS_VOLUME_FLOW_RATE, "bus_class": 5, "accuracy_decimals": 0},
+    # ODU expansion valve position from register 0608 byte [2] (0-100 percent).
+    # Ramps over 10-15s on cycle transitions; reads 0 (off) or 100 (running) otherwise.
+    "odu_expansion_valve": {"key": "odu_expansion_valve", "unit": "%", "bus_class": 5},
     "odu_commanded_stage": {"key": "odu_commanded_stage", "unit": "", "bus_class": 5},
     "odu_stage": {"key": "odu_stage", "unit": "", "bus_class": 5},
     "odu_mode": {"key": "odu_operating_mode", "unit": "", "bus_class": 5},
@@ -32,11 +94,8 @@ SENSOR_TYPES = {
     # over a 24h capture via the OFF→HIGH endpoint discriminator; units per Anantha registry)
     "odu_dc_bus_voltage": {"key": "odu_dc_bus_voltage", "unit": "V", "device_class": DEVICE_CLASS_VOLTAGE, "bus_class": 5},
     "odu_ac_line_current": {"key": "odu_ac_line_current", "unit": "A", "device_class": DEVICE_CLASS_CURRENT, "bus_class": 5},
-    "odu_ipm_temp": {"key": "odu_ipm_temp", "unit": "°C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    "odu_pfcm_temp": {"key": "odu_pfcm_temp", "unit": "°C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    # ODU live suction superheat from register 0613 data[52] float32 (\u00b0F\u2192\u00b0C delta).
-    # The correct live value; 061f idx2 below is a STATIC target, kept for reference.
-    "odu_suction_superheat": {"key": "odu_suction_superheat", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    "odu_ipm_temp": {"key": "odu_ipm_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    "odu_pfcm_temp": {"key": "odu_pfcm_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     # ODU refrigerant pressures from register 0303 u16 BE /16 (psig). Confirmed across
     # an OFF\u2192HIGH transition vs Anantha (suction counter-trended the compressor ramp).
     "odu_suction_pressure": {"key": "odu_suction_pressure", "unit": "psi", "device_class": DEVICE_CLASS_PRESSURE, "bus_class": 5},
@@ -44,46 +103,106 @@ SENSOR_TYPES = {
     # ODU inverter/compressor input power from register 0625 data[0] u16 BE (W).
     # Confirmed vs Anantha instant_power over a 24h heat+cool capture (R²=0.98).
     "odu_power": {"key": "odu_power", "unit": "W", "device_class": DEVICE_CLASS_POWER, "bus_class": 5},
-    # ODU IEEE754 float32 values from register 061f \u2014 STATIC targets, not live measurements
-    "odu_float_1": {"key": "odu_float_1", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    "odu_float_2": {"key": "odu_float_2", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    "odu_float_3": {"key": "odu_float_3", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    "odu_float_4": {"key": "odu_float_4", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    "odu_float_5": {"key": "odu_float_5", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    # ODU IEEE754 float32 values from register 061f. idx 1..5 are DELTAS
+    # (superheat/subcooling/control \u0394T) and are STATIC TARGETS, not live
+    # measurements. Published in NATIVE \u00b0F with NO device_class: HA's temperature
+    # conversion applies a +32 offset that corrupts deltas (3\u00b0F -> 1.67\u00b0C ->
+    # displayed as 35\u00b0F). idx 6 is dimensionless. The LIVE suction superheat is
+    # the 0302 idx3 \u0394T published as "odu_suction_superheat" below.
+    "odu_float_1": {"key": "odu_float_1", "unit": "\u00b0F", "bus_class": 5},
+    "odu_float_2": {"key": "odu_float_2", "unit": "\u00b0F", "bus_class": 5},
+    "odu_float_3": {"key": "odu_float_3", "unit": "\u00b0F", "bus_class": 5},
+    "odu_float_4": {"key": "odu_float_4", "unit": "\u00b0F", "bus_class": 5},
+    "odu_float_5": {"key": "odu_float_5", "unit": "\u00b0F", "bus_class": 5},
     "odu_float_6": {"key": "odu_float_6", "unit": "", "bus_class": 5},
     # ODU register 0302 temperature measurements
     "odu_outdoor_temp": {"key": "odu_outdoor_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_coil_temp": {"key": "odu_coil_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_suction_temp": {"key": "odu_suction_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    "odu_subcooling_degf_int": {"key": "odu_subcooling_degf_int", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
+    # \u0394T (delta): published native \u00b0F, no device_class (HA's temp conversion
+    # adds +32, corrupting deltas). Matches the thermostat's \u00b0F superheat display.
+    "odu_suction_superheat": {"key": "odu_suction_superheat", "unit": "\u00b0F", "bus_class": 5},
     "odu_indoor_ambient": {"key": "odu_indoor_ambient", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_discharge_temp": {"key": "odu_discharge_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
-    # ZC zone temperatures (register 0302, device class 6 = 0x60>>4)
-    # Value encoding: raw = (°F - 64) × 16, converted to °C for HA
+    # ZC register 0302 (device class 6 = 0x60>>4). 24-byte TLV [tag,id,hi,lo],
+    # °F = uint16_BE / 16. zone N -> id N; id 0x14 = LAT, id 0x1C = HPT.
+    # LAT/HPT exist only on zone boards with those thermistor ports wired, so
+    # they default to disabled (enable in HA if your board reports them).
     "zc_zone_temperature": {"key": "zc_zone_temperature", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 6},
+    "zc_lat": {"key": "zc_lat", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 6, "disabled_by_default": True},
+    "zc_hpt": {"key": "zc_hpt", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 6, "disabled_by_default": True},
     # IDU cycle counters (register 0310, 4-byte key-value entries) — device class 4
-    "idu_low_heat_cycles": {"key": "idu_low_heat_cycles", "unit": "cycles", "bus_class": 4},
-    "idu_high_heat_cycles": {"key": "idu_high_heat_cycles", "unit": "cycles", "bus_class": 4},
-    "idu_med_heat_cycles": {"key": "idu_med_heat_cycles", "unit": "cycles", "bus_class": 4},
-    "idu_blower_cycles": {"key": "idu_blower_cycles", "unit": "cycles", "bus_class": 4},
-    "idu_poweron_cycles": {"key": "idu_poweron_cycles", "unit": "cycles", "bus_class": 4},
+    "idu_low_heat_cycles": {"key": "idu_low_heat_cycles", "bus_class": 4, **_CYCLES},
+    "idu_high_heat_cycles": {"key": "idu_high_heat_cycles", "bus_class": 4, **_CYCLES},
+    "idu_med_heat_cycles": {"key": "idu_med_heat_cycles", "bus_class": 4, **_CYCLES},
+    "idu_blower_cycles": {"key": "idu_blower_cycles", "bus_class": 4, **_CYCLES},
+    "idu_poweron_cycles": {"key": "idu_poweron_cycles", "bus_class": 4, **_CYCLES},
     # IDU runtime hours (register 0311, 4-byte key-value entries) — device class 4
-    "idu_low_heat_hours": {"key": "idu_low_heat_hours", "unit": "h", "bus_class": 4},
-    "idu_high_heat_hours": {"key": "idu_high_heat_hours", "unit": "h", "bus_class": 4},
-    "idu_med_heat_hours": {"key": "idu_med_heat_hours", "unit": "h", "bus_class": 4},
-    "idu_blower_hours": {"key": "idu_blower_hours", "unit": "h", "bus_class": 4},
-    "idu_poweron_hours": {"key": "idu_poweron_hours", "unit": "h", "bus_class": 4},
+    "idu_low_heat_hours": {"key": "idu_low_heat_hours", "bus_class": 4, **_HOURS},
+    "idu_high_heat_hours": {"key": "idu_high_heat_hours", "bus_class": 4, **_HOURS},
+    "idu_med_heat_hours": {"key": "idu_med_heat_hours", "bus_class": 4, **_HOURS},
+    "idu_blower_hours": {"key": "idu_blower_hours", "bus_class": 4, **_HOURS},
+    "idu_poweron_hours": {"key": "idu_poweron_hours", "bus_class": 4, **_HOURS},
     # ODU cycle counters (register 0310) — device class 5
-    "odu_heat_cycles": {"key": "odu_heat_cycles", "unit": "cycles", "bus_class": 5},
-    "odu_cool_cycles": {"key": "odu_cool_cycles", "unit": "cycles", "bus_class": 5},
-    "odu_defrost_cycles": {"key": "odu_defrost_cycles", "unit": "cycles", "bus_class": 5},
-    "odu_poweron_cycles": {"key": "odu_poweron_cycles", "unit": "cycles", "bus_class": 5},
+    "odu_heat_cycles": {"key": "odu_heat_cycles", "bus_class": 5, **_CYCLES},
+    "odu_cool_cycles": {"key": "odu_cool_cycles", "bus_class": 5, **_CYCLES},
+    "odu_defrost_cycles": {"key": "odu_defrost_cycles", "bus_class": 5, **_CYCLES},
+    "odu_poweron_cycles": {"key": "odu_poweron_cycles", "bus_class": 5, **_CYCLES},
     # ODU runtime hours (register 0311) — device class 5
-    "odu_heat_hours": {"key": "odu_heat_hours", "unit": "h", "bus_class": 5},
-    "odu_cool_hours": {"key": "odu_cool_hours", "unit": "h", "bus_class": 5},
-    "odu_defrost_hours": {"key": "odu_defrost_hours", "unit": "h", "bus_class": 5},
-    "odu_poweron_hours": {"key": "odu_poweron_hours", "unit": "h", "bus_class": 5},
+    "odu_heat_hours": {"key": "odu_heat_hours", "bus_class": 5, **_HOURS},
+    "odu_cool_hours": {"key": "odu_cool_hours", "bus_class": 5, **_HOURS},
+    "odu_defrost_hours": {"key": "odu_defrost_hours", "bus_class": 5, **_HOURS},
+    "odu_poweron_hours": {"key": "odu_poweron_hours", "bus_class": 5, **_HOURS},
+    # Timestamp (epoch seconds) of the most recent thermostat fault-log entry
+    # (register 0x4202). Age is bus-derived; anchored to the ESPHome time source
+    # given by the sensor's `time_id`. No fault liveness exists on the bus.
+    # Timestamp sensors must carry NO state class (HA rejects the entity
+    # otherwise) and no unit — the wireguard latest_handshake pattern.
+    "fault_timestamp": {"key": "fault_timestamp", "device_class": DEVICE_CLASS_TIMESTAMP, "state_class": STATE_CLASS_NONE, "accuracy_decimals": 0, "bus_class": 0},
+    # Generic bus-field sensor: user specifies device/register/offset/datatype/scale
+    # (decode mode) or a full-frame lambda. bus_class is derived from device_address.
+    "raw_register": {"key": "raw_register", "bus_class": 0},
 }
+
+def _apply_sensor_type(config):
+    """Inject unit/device_class/accuracy_decimals/state_class from SENSOR_TYPES,
+    and force disabled_by_default for sensor types that opt into it (e.g.
+    zc_lat/zc_hpt). raw_register supplies its own from yaml, so it is skipped."""
+    if config[CONF_TYPE] == "raw_register":
+        return config
+    if config[CONF_TYPE] in DEPRECATED_SENSOR_TYPES:
+        _LOGGER.warning(
+            "Sensor type '%s' is deprecated, use '%s' instead",
+            config[CONF_TYPE], DEPRECATED_SENSOR_TYPES[config[CONF_TYPE]])
+    info = SENSOR_TYPES[config[CONF_TYPE]]
+    config[sensor.CONF_UNIT_OF_MEASUREMENT] = info.get("unit", "")
+    config[sensor.CONF_DEVICE_CLASS] = info.get("device_class", "")
+    config[CONF_ACCURACY_DECIMALS] = info.get("accuracy_decimals", 1)
+    config[CONF_STATE_CLASS] = sensor.validate_state_class(info.get("state_class", STATE_CLASS_MEASUREMENT))
+    if info.get("disabled_by_default"):
+        config[CONF_DISABLED_BY_DEFAULT] = True
+    return config
+
+
+def _validate_raw_register(config):
+    """raw_register needs device_address + register, and either datatype (decode
+    mode) or lambda (full-frame decode), mutually exclusive."""
+    if config[CONF_TYPE] != "raw_register":
+        return config
+    if CONF_DEVICE_ADDRESS not in config:
+        raise cv.Invalid("raw_register requires 'device_address'")
+    if CONF_REGISTER not in config:
+        raise cv.Invalid("raw_register requires 'register'")
+    has_lambda = CONF_LAMBDA in config
+    has_datatype = CONF_DATATYPE in config
+    if has_lambda and has_datatype:
+        raise cv.Invalid("raw_register: 'lambda' and 'datatype' are mutually exclusive")
+    if not has_lambda and not has_datatype:
+        raise cv.Invalid("raw_register: requires either 'datatype' or 'lambda'")
+    if (CONF_VALUE_MIN in config) != (CONF_VALUE_MAX in config):
+        raise cv.Invalid("raw_register: 'value_min' and 'value_max' must be set together")
+    return config
+
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema({cv.Required(CONF_TYPE): cv.one_of(*SENSOR_TYPES, lower=True)}).extend(
@@ -95,11 +214,23 @@ CONFIG_SCHEMA = cv.All(
             {
                 cv.GenerateID(CONF_INFINITESP_ID): cv.use_id(CONF_INFINITESP_ID),
                 cv.Optional(CONF_ZONE, default=1): cv.int_range(min=1, max=8),
+                # raw_register extras (ignored by other sensor types):
+                cv.Optional(CONF_DEVICE_ADDRESS): cv.hex_uint8_t,
+                cv.Optional(CONF_REGISTER): cv.hex_uint16_t,
+                # fault_timestamp: the ESPHome time source used to anchor the
+                # bus-relative fault time to an epoch timestamp.
+                cv.Optional(CONF_TIME_ID): cv.use_id("time.RealTimeClock"),
+                cv.Optional(CONF_OFFSET, default=0): cv.int_range(min=0, max=250),
+                cv.Optional(CONF_DATATYPE): cv.one_of(*RAW_DATATYPES, lower=True),
+                cv.Optional(CONF_SCALE, default=1.0): cv.float_,
+                cv.Optional(CONF_VALUE_MIN): cv.float_,
+                cv.Optional(CONF_VALUE_MAX): cv.float_,
+                cv.Optional(CONF_LAMBDA): cv.lambda_,
             }
         )
     ),
-    lambda config: {**config, sensor.CONF_UNIT_OF_MEASUREMENT: SENSOR_TYPES[config[CONF_TYPE]]["unit"],
-                    sensor.CONF_DEVICE_CLASS: SENSOR_TYPES[config[CONF_TYPE]].get("device_class", "")},
+    _validate_raw_register,
+    _apply_sensor_type,
 )
 
 
@@ -110,5 +241,38 @@ async def to_code(config):
     await sensor.register_sensor(var, config)
     cg.add(var.set_zone(config[CONF_ZONE]))
     cg.add(var.set_sensor_type(info["key"]))
-    cg.add(var.set_bus_class(info.get("bus_class", 0)))
+    if CONF_TIME_ID in config:
+        # Generate the epoch provider as a lambda in main.cpp rather than passing
+        # a RealTimeClock* into the component: builds stage only the components a
+        # config uses, so a config without a time platform lacks the time header
+        # and our component must not include it (issue #26). With time_id set the
+        # time component is necessarily configured, so main.cpp has the header.
+        await cg.get_variable(config[CONF_TIME_ID])  # config-time existence check
+        cg.add(
+            var.set_epoch_provider(
+                cg.RawExpression(
+                    f"[]() -> time_t {{ auto t = id({config[CONF_TIME_ID].id}).now(); "
+                    f"return t.is_valid() ? t.timestamp : (time_t) 0; }}"
+                )
+            )
+        )
+    if stype == "raw_register":
+        dev = config[CONF_DEVICE_ADDRESS]
+        cg.add(var.set_bus_class(dev >> 4))
+        cg.add(var.set_raw_target(dev, config[CONF_REGISTER]))
+        cg.add(var.set_raw_offset(config[CONF_OFFSET]))
+        cg.add(var.set_raw_scale(config[CONF_SCALE]))
+        if CONF_DATATYPE in config:
+            cg.add(var.set_raw_datatype(config[CONF_DATATYPE]))
+        if CONF_VALUE_MIN in config:
+            cg.add(var.set_raw_value_range(config[CONF_VALUE_MIN], config[CONF_VALUE_MAX]))
+        if CONF_LAMBDA in config:
+            lam = await cg.process_lambda(
+                config[CONF_LAMBDA],
+                [(cg.std_vector.template(cg.uint8).operator("const").operator("ref"), "data")],
+                return_type=cg.float_,
+            )
+            cg.add(var.set_raw_lambda(lam))
+    else:
+        cg.add(var.set_bus_class(info.get("bus_class", 0)))
     await register_infinitesp_entity(var, config)

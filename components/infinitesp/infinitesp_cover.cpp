@@ -35,15 +35,22 @@ void InfinitESPCover::control(const cover::CoverCall &call) {
 }
 
 void InfinitESPCover::on_register_update(uint8_t device_addr, uint16_t register_key) {
-  // Damper positions arrive as a 4-byte WRITE to 0308 (one byte per zone,
-  // zones 1-4) and are mirrored to 0319. Both keys notify; react to either.
+  // Damper command is an 8-byte WRITE to 0308, one byte per system zone. We
+  // read 0308, not 0319 state feedback (the secondary controller returns
+  // all-FF there). Both keys notify; accept either and re-read 0308.
   if (register_key != REG_ZC_DAMPER_CMD && register_key != REG_ZC_ZONE_CONFIG)
     return;
-  if (zone_ < 1 || zone_ > 4)
+  if (zone_ < 1 || zone_ > 8)
+    return;
+  // Only react to the controller serving this zone (0x60 for zones 1-4, 0x61
+  // for 5-8). Both store identical system payloads and both notify; this guard
+  // keeps each cover to one update per cycle.
+  if (device_addr != parent_->zc_addr_for_zone_(zone_))
     return;
 
+  // System-wide payload: zone N is at byte N-1 (zc_system_byte_for_zone_).
   auto *data = parent_->get_register(device_addr, REG_ZC_DAMPER_CMD);
-  if (!data || data->size() < 4)
+  if (!data)
     return;
 
   // The damper byte is itself the step (0x00-0x0F). Compare in step space so
@@ -52,7 +59,14 @@ void InfinitESPCover::on_register_update(uint8_t device_addr, uint16_t register_
   // transient (control()) snapping back to the bus value still fires when the
   // steps actually differ. Anchor: last_step_ (0xFF sentinel fires the first
   // time, so a zone fully-open at boot still actuates).
-  apply_step_(data->at(zone_ - 1));
+  //
+  // 0308/0319 are 8-byte system-wide payloads, one byte per system zone: zone N
+  // sits at byte N-1, not (N-1)%4 — that local-id mapping aliases zones 5-8 onto
+  // 1-4 (issue #9). zc_system_byte_for_zone_ is the named anchor for that.
+  uint8_t byte_idx = parent_->zc_system_byte_for_zone_(zone_);
+  if (byte_idx >= data->size())
+    return;
+  apply_step_((*data)[byte_idx]);
 }
 
 }  // namespace infinitesp

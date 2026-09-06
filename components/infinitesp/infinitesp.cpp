@@ -1,7 +1,10 @@
 #include "infinitesp.h"
+#include "version.h"
 #include "esphome/components/sensor/sensor.h"
 #include <cctype>
 #include <string>
+
+#include <algorithm>
 
 namespace esphome {
 namespace infinitesp {
@@ -14,10 +17,12 @@ static const uint8_t POLL_REGS[][2] = {
 };
 static const uint8_t POLL_REG_COUNT = 2;
 
-// Slow-poll thermostat registers (0x4xxx tables, polled less frequently)
-// These are thermostat-internal config tables, not SAM registers.
+// Slow-poll thermostat registers, polled less frequently than the 3B02/3B03
+// fast poll. Mix of the device info block (0x0104) and thermostat-internal
+// config tables (0x4xxx).
 static const uint8_t SLOW_POLL_REGS[][2] = {
-    {0x40, 0x0A},  // comfort profiles (home/away/sleep/wake/manual setpoints+fan)
+    {0x01, 0x04},  // device info: model, serial (manufacture date source)
+    // Comfort rows 400A+zone-1 are polled per active zone (see slow-poll block)
     {0x40, 0x12},  // vacation settings (min/max temp, fan)
     {0x42, 0x02},  // fault history (10 entries × 7 bytes)
     {0x46, 0x08},  // WiFi: SSID, password, hostname
@@ -26,6 +31,41 @@ static const uint8_t SLOW_POLL_REGS[][2] = {
 };
 static const uint8_t SLOW_POLL_REG_COUNT = 6;
 static const uint32_t SLOW_POLL_INTERVAL_MS = 31000;  // poll every 31s (prime, avoids beating with other timers)
+
+// ODU slow-poll union set: registers consumed by curated odu_* sensors that at
+// least one equipment family never receives passively. 0304 (line voltage) is
+// polled by some thermostats only while their status screen is open (issue #21);
+// 3E01/3E02 (2-stage/two-capacity temps + stage) and 3E08 (identity) are not
+// polled at all by some thermostats. One register per 31s cycle per observed
+// class-5 device. Variable-speed units refuse the 3E entries with FUNC 0x15
+// (probed live on a 24VNA9); refusals are blacklisted for the session.
+static const uint16_t ODU_SLOW_POLL_REGS[] = {0x0304, 0x3E01, 0x3E02, 0x3E08};
+static const uint8_t ODU_SLOW_POLL_REG_COUNT = 4;
+static const uint32_t ODU_SLOW_POLL_INTERVAL_MS = 31000;
+// Table-name discovery: probe one observed (device, table) 0xNN01 per cycle.
+// Conservative cadence to stay off the thermostat's bus schedule.
+static const uint32_t DISCOVERY_POLL_INTERVAL_MS = 3500;
+static const uint8_t TABLEDEF_ROW = 0x01;  // every table's self-describing register is at row 01
+
+// Install-discovery holdoff. The thermostat transmits as ADDR_DISCOVERY
+// (0x1F) only while running system discovery/commissioning. In steady state
+// that address never appears: across init captures it shows as a single ~10s
+// burst and nothing else. The discovery sequence that follows the burst
+// (thermostat-driven 3405 presence probing and 041e smart-sensor scans) is
+// timing-sensitive. Unsolicited bus traffic from this component (polls,
+// retransmits, discovery and metric probes) can corrupt it and make device
+// detection fail (issue #8), so all five initiated-TX paths pause for this
+// window after the last 0x1F frame. Reactive handling (READ/WRITE addressed to
+// the emulated SAM/ZC) and passive snooping keep running, so the emulated
+// devices stay discoverable.
+//
+// Discovery outlasts the 0x1F burst. Two init captures show the full discovery
+// tail ending about 41s and 105s after the last 0x1F frame, so the holdoff
+// must cover that tail. 180s covers both with margin. The spread between the
+// two is the argument for a future refinement that re-arms the holdoff on
+// observed 3405 presence frames instead of a fixed window. The constant lives
+// in the header (DISCOVERY_HOLDOFF_MS) so the inline
+// commissioning_holdoff_active_() helper can see it.
 
 // Write retransmit delay. Each WRITE is re-sent once after this interval to
 // ride through sporadic drops. Must stay <= PENDING_SETPOINT_WINDOW_MS/2
@@ -50,7 +90,7 @@ static std::vector<uint8_t> build_sam_write_payload_(uint8_t table, uint8_t row,
 }
 
 void InfinitESPComponent::setup() {
-  ESP_LOGI("InfinitESP", "InfinitESP v0.1.0 build %s %s", __DATE__, __TIME__);
+  ESP_LOGI("InfinitESP", "InfinitESP v%s build %s %s", INFINITESP_VERSION, __DATE__, __TIME__);
   ESP_LOGI("InfinitESP", "SAM Address=0x%02X", sam_address_);
   if (zc_enabled())
     ESP_LOGI("InfinitESP", "Zone Controller emulation at 0x%02X", zc_address_);
@@ -104,6 +144,22 @@ void InfinitESPComponent::setup() {
 }
 
 void InfinitESPComponent::loop() {
+  // Publish the firmware version to the (optional) version text sensor once.
+  if (version_text_sensor_ != nullptr && !version_published_) {
+    version_text_sensor_->publish_state(INFINITESP_VERSION);
+    version_published_ = true;
+  }
+
+  // Fire debounced timed-hold sets from the setter entities (see
+  // queue_hold_set): one write per zone after the target settles.
+  for (uint8_t z = 0; z < 8; z++) {
+    if (pending_hold_sets_[z].active && millis() >= pending_hold_sets_[z].until_ms) {
+      pending_hold_sets_[z].active = false;
+      ESP_LOGI("InfinitESP", "Zone %u hold set -> %u min", z + 1, pending_hold_sets_[z].minutes);
+      set_zone_hold(z + 1, pending_hold_sets_[z].minutes);
+    }
+  }
+
   uint32_t loop_start = millis();
 
   // NOTE: no echo suppression needed. RS485 auto-direction transceivers disable
@@ -153,12 +209,19 @@ void InfinitESPComponent::loop() {
     }
     diag_poll_purged_ += purged;
 
+    // CRC pass rate over all complete frames (parsed / (parsed + failed)).
+    // Inverts crc_fail into a quality metric where higher is better, and gives
+    // the raw counter a denominator (issue #17: crc_fail=4118 looked alarming
+    // on its own). 100% until the first frame arrives.
+    uint32_t total_frames = diag_frames_parsed_ + diag_crc_fail_;
+    float crc_ok = total_frames ? (100.0f * diag_frames_parsed_ / total_frames) : 100.0f;
+
     ESP_LOGI("InfinitESP", "STATS rx_bytes=%u tx_bytes=%u rx_frames=%u tx_frames=%u "
-             "crc_fail=%u resync_drops=%u stale=%u uart_hwm=%u overflow_evts=%u "
+             "crc_fail=%u crc_ok=%.2f%% resync_drops=%u stale=%u uart_hwm=%u overflow_evts=%u "
              "reply_exp=%u reply_got=%u reply_exc=%u reply_timeout=%u poll_pending=%u "
              "tx_flush_max=%ums loop_max=%ums inter_frame=%u..%ums",
              diag_total_rx_bytes_, diag_total_tx_bytes_, diag_frames_parsed_, diag_tx_seq_,
-             diag_crc_fail_, diag_resync_drops_, diag_stale_discard_, diag_uart_hwm_, diag_uart_overflow_events_,
+             diag_crc_fail_, crc_ok, diag_resync_drops_, diag_stale_discard_, diag_uart_hwm_, diag_uart_overflow_events_,
              diag_reply_expected_, diag_reply_received_, diag_reply_exception_, diag_reply_timeout_,
              (uint32_t) pending_polls_.size(),
              diag_tx_flush_max_ms_, diag_loop_max_ms_,
@@ -221,10 +284,22 @@ void InfinitESPComponent::loop() {
   // would clip the reply and show up as a poll timeout.
   const uint32_t bus_idle_ms = last_rx_time_ ? (now - last_rx_time_) : 1000;
 
+  // Install-discovery holdoff (issue #8). Pause all five initiated-TX paths
+  // while the thermostat runs discovery/commissioning (ADDR_DISCOVERY 0x1F
+  // seen recently), to avoid corrupting its timing-sensitive zone and
+  // smart-sensor presence probing. Reactive READ/WRITE handling and snooping
+  // are not gated: the emulated SAM/ZC must stay discoverable. See
+  // dispatch_frame_() for the stamp and DISCOVERY_HOLDOFF_MS for the window.
+  const bool discovery_holdoff = commissioning_holdoff_active_();
+  if (!discovery_holdoff && discovery_holdoff_engaged_) {
+    discovery_holdoff_engaged_ = false;
+    ESP_LOGI("InfinitESP", "Install discovery holdoff expired - resuming initiated bus TX");
+  }
+
   // Drain due write retransmit (one per iteration, bus-idle gated). Suppresses
   // the fast/slow polls this iteration to avoid back-to-back TX to the thermostat.
   bool retransmit_sent = false;
-  if (!pending_retransmits_.empty() && bus_idle_ms > 50 &&
+  if (!discovery_holdoff && !pending_retransmits_.empty() && bus_idle_ms > 50 &&
       (int32_t) (pending_retransmits_.front().fire_ms - now) <= 0) {
     auto &r = pending_retransmits_.front();
     uint16_t rk = r.payload.size() >= 3 ? (uint16_t) ((r.payload[1] << 8) | r.payload[2]) : 0;
@@ -236,7 +311,7 @@ void InfinitESPComponent::loop() {
   }
 
   bool fast_poll_sent = false;
-  if (sam_enabled() && !retransmit_sent && (now - last_poll_time_ > 3000) && bus_idle_ms > 50) {
+  if (!discovery_holdoff && sam_enabled() && !retransmit_sent && (now - last_poll_time_ > 3000) && bus_idle_ms > 50) {
     poll_thermostat_();
     last_poll_time_ = now;
     fast_poll_sent = true;
@@ -246,11 +321,42 @@ void InfinitESPComponent::loop() {
   // MUST NOT fire in the same loop iteration as the fast poll — sending
   // two READ frames to the same thermostat back-to-back causes the echo
   // drain to eat one of the replies (observed 44% poll timeout rate).
-  if (sam_enabled() && !fast_poll_sent && !retransmit_sent && bus_online_ &&
+  bool tstat_slow_sent = false;
+  if (!discovery_holdoff && sam_enabled() && !fast_poll_sent && !retransmit_sent && bus_online_ &&
       (now - last_slow_poll_time_ >= SLOW_POLL_INTERVAL_MS) && bus_idle_ms > 50) {
-    const auto &sreg = SLOW_POLL_REGS[slow_poll_index_ % SLOW_POLL_REG_COUNT];
-    uint16_t sreg_key = (sreg[0] << 8) | sreg[1];
-    ESP_LOGI("InfinitESP", "SLOW POLL thermostat for %02X%02X", sreg[0], sreg[1]);
+    // Rotation: one comfort row per set bit in the 3B02 active-zones mask
+    // (400A for zone 1, 400B for zone 2, ...) first, then the fixed registers.
+    // Comfort-first keeps zone 1's 400A in the first slot after boot (the
+    // preset matcher needs it) and picks up extra zones one slot later each.
+    // The mask is re-read each rotation, so a re-commissioned zone count takes
+    // effect without a reboot. Mask unreadable (early boot) degrades to zone
+    // 1's row only, which is what a single-zone system needs anyway.
+    uint8_t active = get_zone_active_mask();
+    uint8_t n_active = 0;
+    for (uint8_t b = 0; b < 8; b++)
+      n_active += (active >> b) & 1;
+    if (n_active == 0) {
+      active = 0x01;
+      n_active = 1;
+    }
+    uint16_t idx = slow_poll_index_ % (SLOW_POLL_REG_COUNT + n_active);
+    uint16_t sreg_key;
+    if (idx < n_active) {
+      uint8_t want = idx;  // nth set bit
+      uint8_t seen = 0, zone = 1;
+      for (; zone <= 8; zone++) {
+        if (active & (1 << (zone - 1))) {
+          if (seen == want)
+            break;
+          seen++;
+        }
+      }
+      sreg_key = comfort_reg_for_zone(zone);
+    } else {
+      const auto &sreg = SLOW_POLL_REGS[idx - n_active];
+      sreg_key = (sreg[0] << 8) | sreg[1];
+    }
+    ESP_LOGI("InfinitESP", "SLOW POLL thermostat for %04X", sreg_key);
 
     PendingPoll spp;
     spp.sent_ms = millis();
@@ -259,12 +365,50 @@ void InfinitESPComponent::loop() {
     pending_polls_.push_back(spp);
     diag_reply_expected_++;
 
-    std::vector<uint8_t> spayload = {0x00, sreg[0], sreg[1]};
+    std::vector<uint8_t> spayload = {0x00, (uint8_t) (sreg_key >> 8), (uint8_t) (sreg_key & 0xFF)};
     send_frame_(ADDR_THERMOSTAT, 0x01, FUNC_READ, spayload);
     pending_polls_.back().tx_seq = diag_tx_seq_;
 
     slow_poll_index_++;
     last_slow_poll_time_ = now;
+    tstat_slow_sent = true;
+  }
+
+  // ODU slow poll: acquisition backstop for registers the local thermostat
+  // never polls (or polls only while its status screen is open). Same one-TX-
+  // per-iteration rule; phase-shifted half a cycle from the thermostat slow
+  // poll (see last_odu_slow_poll_time_) so they never share an iteration.
+  if (!discovery_holdoff && sam_enabled() && !fast_poll_sent && !retransmit_sent && !tstat_slow_sent &&
+      bus_online_ && (now - last_odu_slow_poll_time_ >= ODU_SLOW_POLL_INTERVAL_MS) && bus_idle_ms > 50) {
+    poll_odu_slow_();
+    last_odu_slow_poll_time_ = now;
+  }
+
+  // Table-name discovery: probe one observed device's 0xNN01 register from
+  // ADDR_FAKESAM (0x93) when 0x93 is free (not our SAM address). One query
+  // per cycle, never in the same iteration as a thermostat poll.
+  if (!discovery_holdoff && sam_address_ != ADDR_FAKESAM && bus_online_ &&
+      !fast_poll_sent && !retransmit_sent &&
+      (now - last_discovery_poll_ms_ >= DISCOVERY_POLL_INTERVAL_MS) && bus_idle_ms > 50) {
+    poll_discovery_();
+    last_discovery_poll_ms_ = now;
+  }
+
+  // Metric-units poll (AUTO mode, NOT emulating the SAM): the thermostat
+  // doesn't push 3B06 without a SAM, so poll its 3B05 as FakeSAM. Once on
+  // first RX activity, then every 5 min in case the user changes the unit.
+  // When emulating the SAM, the tstat's 3B06 push is the source (no poll).
+  // NOTE: gated on last_rx_time_ (frames being seen), NOT bus_online_ — that
+  // flag only flips for replies addressed to us, which never happens in a
+  // pure-passive (no-emulation) config.
+  bool bus_active = (now - last_rx_time_) < 5000;
+  if (!discovery_holdoff && temperature_unit_ == TemperatureUnit::AUTO && !sam_enabled() &&
+      sam_address_ != ADDR_FAKESAM && bus_active &&
+      !fast_poll_sent && !retransmit_sent && bus_idle_ms > 50 &&
+      (!metric_units_known_ || (now - last_unit_poll_ms_) > 300000) &&
+      (now - last_unit_poll_ms_) > 5000) {
+    poll_metric_units_();
+    last_unit_poll_ms_ = now;
   }
 
   // ZC sensor staleness fallback: check every 10s
@@ -427,9 +571,23 @@ void InfinitESPComponent::dispatch_frame_(uint16_t frame_len) {
            func_name, current_frame_.length, current_frame_.payload.size(),
            payload_hex, current_frame_.payload.size() > 32 ? "..." : "");
 
+  // The thermostat transmits as ADDR_DISCOVERY (0x1F) only during system
+  // discovery/commissioning. Stamp it so loop() can pause initiated TX for
+  // the holdoff window (issue #8). Reactive handling below is unaffected: the
+  // emulated SAM/ZC stays discoverable.
+  if (current_frame_.src == ADDR_DISCOVERY || current_frame_.dst == ADDR_DISCOVERY) {
+    discovery_seen_ = true;
+    last_discovery_ms_ = millis();
+    if (!discovery_holdoff_engaged_) {
+      discovery_holdoff_engaged_ = true;
+      ESP_LOGI("InfinitESP", "Install discovery (0x1F) observed - pausing initiated bus TX for %us",
+               (unsigned) (DISCOVERY_HOLDOFF_MS / 1000));
+    }
+  }
+
   // Check if addressed to us (SAM or optional zone controller)
   bool to_us = (sam_enabled() && current_frame_.dst == sam_address_);
-  bool to_zc = (zc_enabled() && current_frame_.dst == zc_address_);
+  bool to_zc = is_emu_zc_addr_(current_frame_.dst);
 
   // --- SAM enrollment diagnostic ---
   // The thermostat only *initiates* reads/writes to a SAM it has enrolled in
@@ -499,12 +657,18 @@ void InfinitESPComponent::dispatch_frame_(uint16_t frame_len) {
   // Handle replies from thermostat regardless of to_us flag.
   // Our poll responses have dst=our address (to_us=true), but the original
   // snooping path only checked the else branch. Thermostat may also send
-  // replies addressed to us or to broadcast.
-  if (current_frame_.src == ADDR_THERMOSTAT && current_frame_.func == FUNC_REPLY) {
+  // replies addressed to us or to broadcast. Discovery replies (dst=0x93)
+  // are handled separately below, so exclude them here.
+  bool reply_handled = false;
+  if (current_frame_.src == ADDR_THERMOSTAT && current_frame_.func == FUNC_REPLY &&
+      current_frame_.dst != ADDR_FAKESAM) {
     handle_reply_();
+    reply_handled = true;
   }
 
-  if (to_us || to_zc) {
+  if (current_frame_.func == FUNC_REPLY && current_frame_.dst == ADDR_FAKESAM) {
+    handle_discovery_reply_();
+  } else if (!reply_handled && (to_us || to_zc)) {
     switch (current_frame_.func) {
       case FUNC_READ:
         handle_read_request_();
@@ -512,10 +676,22 @@ void InfinitESPComponent::dispatch_frame_(uint16_t frame_len) {
       case FUNC_WRITE:
         handle_write_request_();
         break;
+      case FUNC_REPLY:
+        // Reply to OUR poll from a non-thermostat device (ODU slow poll). Same
+        // path as thermostat replies: store under the reply's source address
+        // and notify, so actively-polled ODU registers behave identically to
+        // passively-snooped ones.
+        handle_reply_();
+        break;
+      case FUNC_EXCEPTION:
+        // 0x15: the device refuses the register (e.g. variable-speed ODU has
+        // no table 3E). Match the pending poll and blacklist the pair.
+        handle_exception_();
+        break;
       default:
         break;
     }
-  } else {
+  } else if (!reply_handled) {
     handle_passive_frame_();
   }
 
@@ -612,14 +788,16 @@ void InfinitESPComponent::handle_passive_frame_() {
                  data.size() > 2 ? data[2] : 0, data.size() > 3 ? data[3] : 0);
       }
       if (reg_key == REG_ODU_COMP_SPEED) {
-        float comp_rpm = odu_compressor_rpm_(data);
-        if (!std::isnan(comp_rpm))
-          ESP_LOGD("InfinitESP", "ODU 0604: compressor_rpm=%u (%u bytes)",
-                   (unsigned) comp_rpm, data.size());
+        float target = odu_compressor_target_rpm_(data);
+        float actual = odu_compressor_actual_rpm_(data);
+        if (!std::isnan(target) && !std::isnan(actual))
+          ESP_LOGD("InfinitESP", "ODU 0604: target_rpm=%u actual_rpm=%u (%u bytes)",
+                   (unsigned) target, (unsigned) actual, data.size());
       }
       if (reg_key == REG_ODU_DEMAND && data.size() >= 7) {
-        ESP_LOGD("InfinitESP", "ODU 0608: compressor_frequency=%.1f Hz raw=[%02X %02X %02X %02X %02X %02X %02X]",
-                 odu_compressor_frequency_(data),
+        ESP_LOGD("InfinitESP", "ODU 0608: requested_cfm=%u expansion_valve=%.0f%% raw=[%02X %02X %02X %02X %02X %02X %02X]",
+                 (unsigned) odu_requested_cfm_(data),
+                 odu_expansion_valve_(data),
                  data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
       }
       if (reg_key == REG_ODU_STAGE_INFO && data.size() >= 1) {
@@ -650,25 +828,20 @@ void InfinitESPComponent::handle_passive_frame_() {
       // Alternating (threshold, measurement): offsets 0,4,8,12,16,20 = constants;
       // offsets 2,6,10,14,18,22 = dynamic measurements (accessor idx 0..5).
       if (reg_key == REG_ODU_STATUS1 && data.size() >= 24) {
-        ESP_LOGD("InfinitESP", "ODU 0302: outdoor=%.1f coil=%.1f suction=%.1f liquid=%.1f indoor_amb=%.1f discharge=%.1f",
+        ESP_LOGD("InfinitESP", "ODU 0302: outdoor=%.1f coil=%.1f suction=%.1f superheat=%.1f indoor_amb=%.1f discharge=%.1f",
                  odu_status1_meas_f_(data, 0), odu_status1_meas_f_(data, 1),
                  odu_status1_meas_f_(data, 2), odu_status1_meas_f_(data, 3),
                  odu_status1_meas_f_(data, 4), odu_status1_meas_f_(data, 5));
       }
 
-      // Outdoor fan RPM (060A data[64]) and live suction superheat (0613 data[52]),
-      // both reverse-engineered against Anantha MQTT ground truth.
+      // Outdoor fan RPM (060A data[64]), reverse-engineered against Anantha MQTT
+      // ground truth. (Suction superheat now comes from 0302 idx3 — logged with
+      // the other 0302 measurements above — so 0613 is no longer decoded here.)
       if (reg_key == REG_ODU_FAN) {
         float rpm = odu_outdoor_fan_rpm_(data);
         if (!std::isnan(rpm))
           ESP_LOGD("InfinitESP", "ODU 060a: outdoor_fan_rpm=%u (%u bytes)",
                    (unsigned) rpm, data.size());
-      }
-      if (reg_key == REG_ODU_SUPERHEAT) {
-        float sh = odu_suction_superheat_f_(data);
-        if (!std::isnan(sh))
-          ESP_LOGD("InfinitESP", "ODU 0613: suction_superheat=%.1f °F (%u bytes)",
-                   sh, data.size());
       }
       if (reg_key == REG_ODU_POWER) {
         float w = odu_power_w_(data);
@@ -680,21 +853,23 @@ void InfinitESPComponent::handle_passive_frame_() {
       notify_entities_(src, reg_key);
     }
 
-    // Zone Controller (class 6, 0x60) replies — e.g. zone status (0302).
+    // Zone Controller (class 6, 0x60/0x61) replies — e.g. zone status (0302).
     // Passive monitoring only: when we emulate the ZC, dispatch routes its
     // traffic to handle_read/write_request_ and our own TX never echoes back
     // (auto-direction RS485 disables RX during TX), so this branch only fires
-    // for a real physical ZC. Lets users who don't emulate the ZC still read
-    // zone temps (zc_zone_temperature sensor) from their hardware.
-    if (!zc_enabled() && src_class == 6) {
+    // for real physical ZCs. Multi-ZC: capture each controller under its real
+    // source address (0x60 serves zones 1-4, 0x61 serves zones 5-8) so the
+    // per-zone cover/climate/sensor entities read the correct register.
+    if (!zc_enabled() && src_class == CLASS_ZONE_CTRL) {
       uint8_t table = current_frame_.payload[1];
       uint8_t row = current_frame_.payload[2];
       uint16_t zc_key = (table << 8) | row;
       std::vector<uint8_t> zc_data(current_frame_.payload.begin() + 3,
                                     current_frame_.payload.end());
-      store_register_(ADDR_ZONE_CTRL, zc_key, zc_data);
-      ESP_LOGD("InfinitESP", "ZC %04X reply captured (%u bytes)", zc_key, zc_data.size());
-      notify_entities_(ADDR_ZONE_CTRL, zc_key);
+      uint8_t zc_src = current_frame_.src;  // 0x60 or 0x61
+      store_register_(zc_src, zc_key, zc_data);
+      ESP_LOGD("InfinitESP", "ZC %02X %04X reply captured (%u bytes)", zc_src, zc_key, zc_data.size());
+      notify_entities_(zc_src, zc_key);
     }
   }
 
@@ -712,15 +887,14 @@ void InfinitESPComponent::handle_passive_frame_() {
       }
     }
 
-    // ZC damper command (0308) written by the thermostat to a real physical
-    // zone controller (0x60). When we emulate the ZC this frame is routed to
-    // handle_write_request_ and never reaches here; this branch only fires for
-    // a physical ZC. Capture + mirror to 0319 exactly as the emulation path
-    // does, so the damper cover and per-zone climate action gating work
-    // without emulation.
-    if (!zc_enabled() && current_frame_.dst == ADDR_ZONE_CTRL &&
+    // 0308 damper command from the thermostat to a physical ZC (0x60/0x61).
+    // Emulated-ZC frames go to handle_write_request_ instead, so this only
+    // fires for real hardware. 0308 is an 8-byte system-wide payload (see
+    // zc_system_byte_for_zone_); store the full payload under the destination
+    // controller's address.
+    if (!zc_enabled() && (current_frame_.dst >> 4) == CLASS_ZONE_CTRL &&
         reg_key == REG_ZC_DAMPER_CMD) {
-      store_zc_damper_command_(ADDR_ZONE_CTRL, current_frame_.payload, " (passive)");
+      store_zc_damper_command_(current_frame_.dst, current_frame_.payload, " (passive)");
     }
 
     // Broadcast 3B02 state writes from thermostat (contains time, weekday, etc.)
@@ -856,7 +1030,7 @@ void InfinitESPComponent::handle_read_request_() {
   uint8_t row = current_frame_.payload[2];
   uint16_t reg_key = (table << 8) | row;
   uint8_t dest = current_frame_.dst;  // who they're talking to (SAM or ZC)
-  bool is_zc = (dest == zc_address_);
+  bool is_zc = is_emu_zc_addr_(dest);
 
   ESP_LOGD("InfinitESP", "%s READ %04X from %02X",
            is_zc ? "ZC" : "SAM", reg_key, current_frame_.src);
@@ -884,20 +1058,17 @@ void InfinitESPComponent::handle_read_request_() {
 
 void InfinitESPComponent::store_zc_damper_command_(uint8_t addr, const std::vector<uint8_t> &payload,
                                                    const char *context) {
-  if (payload.size() < 7)
+  if (payload.size() <= 3)
     return;
-  std::vector<uint8_t> damper(payload.begin() + 3, payload.begin() + 7);
+  // 0308 is an 8-byte SYSTEM-WIDE payload (one byte per system zone 1-8), written
+  // identically to both controllers — not a 4-byte per-controller register. Keep
+  // every byte the thermostat sent; truncating to 4 aliased zones 5-8 onto 1-4
+  // and left those dampers stuck (issue #9).
+  std::vector<uint8_t> damper(payload.begin() + 3, payload.end());
   store_register_(addr, REG_ZC_DAMPER_CMD, damper);
-  // Mirror damper positions to 0319 (zones 1-4 from the command, slots 4-7 = 0xFF)
-  std::vector<uint8_t> state_0319(8);
-  for (uint8_t i = 0; i < 4 && i < damper.size(); i++)
-    state_0319[i] = damper[i];
-  for (uint8_t i = 4; i < 8; i++)
-    state_0319[i] = 0xFF;
-  store_register_(addr, REG_ZC_ZONE_CONFIG, state_0319);
-  ESP_LOGD("InfinitESP", "ZC damper%s: %02X %02X %02X %02X", context,
-           damper.size() > 0 ? damper[0] : 0, damper.size() > 1 ? damper[1] : 0,
-           damper.size() > 2 ? damper[2] : 0, damper.size() > 3 ? damper[3] : 0);
+  mirror_damper_to_0319_(addr, damper);
+  ESP_LOGD("InfinitESP", "ZC %02X damper cmd (0308)%s [%u bytes] -> 0319 mirrored",
+           addr, context, damper.size());
   notify_entities_(addr, REG_ZC_DAMPER_CMD);
   notify_entities_(addr, REG_ZC_ZONE_CONFIG);
 }
@@ -910,14 +1081,15 @@ void InfinitESPComponent::handle_write_request_() {
   uint8_t row = current_frame_.payload[2];
   uint16_t reg_key = (table << 8) | row;
   uint8_t dest = current_frame_.dst;  // who they're writing to (SAM or ZC)
-  bool is_zc = zc_enabled() && (dest == zc_address_);
+  bool is_zc = is_emu_zc_addr_(dest);
 
   // ZC-specific write handling
   if (is_zc) {
     ESP_LOGI("InfinitESP", "ZC WRITE %04X from %02X (%d bytes)",
              reg_key, current_frame_.src, current_frame_.payload.size() - 3);
 
-    // 0308: damper position command — mirror immediately to 0319
+    // 0308 damper command (8-byte system-wide; see zc_system_byte_for_zone_).
+    // Store the full payload and mirror to 0319 for the thermostat's duct-eval.
     if (reg_key == REG_ZC_DAMPER_CMD) {
       store_zc_damper_command_(dest, current_frame_.payload, "");
       // 1-byte ACK (matches real ZC behavior)
@@ -1011,8 +1183,12 @@ void InfinitESPComponent::handle_reply_() {
         for (uint8_t i = 0; i < 8; i++) {
           if (active & (1 << i)) {
             uint8_t temp = data[REG3B02_TEMPS + i];
-            // 0xFF = no sensor / offline, skip
-            if (temp != 0xFF) {
+            // 0xFF = no sensor / offline; 0x00 = unpopulated (common during
+            // thermostat reboot before the tstat has filled active-zone slots).
+            // Skip both — neither is a real reading. Treating 0 as real would
+            // trip the <=50 -> °C branch and corrupt stale-sensor fallbacks
+            // (which convert zone-1 ambient via bus_uses_celsius()).
+            if (temp != 0xFF && temp != 0x00) {
               bus_celsius_detected_ = (temp <= 50);
               bus_unit_detected_ = true;
               break;
@@ -1024,11 +1200,23 @@ void InfinitESPComponent::handle_reply_() {
                    bus_celsius_detected_ ? "°C" : "°F");
         }
       }
+
+      // Authoritative metric-units flag from the thermostat's 3B06 push.
+      // The tstat pushes 3B06 to our emulated SAM (dst=0x92); reply stores it
+      // under src (0x20). data[1]: 0=English/°F, 1=Metric/°C (verified 2026-06-26).
+      // SAM-emulated path only — when not emulating we poll 3B05 instead.
+      if (sam_enabled() && reg_key == REG_SAM_DEALER &&
+          current_frame_.src == ADDR_THERMOSTAT &&
+          temperature_unit_ == TemperatureUnit::AUTO) {
+        handle_metric_units_reply_(current_frame_.src, reg_key, data);
+      }
     }
 
     // Log parsed 0x4xxx register contents
-    if (reg_key == REG_TSTAT_COMFORT && data.size() >= 35) {
-      // Comfort profile: 5 activities x 7 bytes each (heat, cool, fan, 4x unknown)
+    if (reg_key >= REG_TSTAT_COMFORT && reg_key <= REG_TSTAT_COMFORT + 7 && data.size() >= 35) {
+      // Comfort profile: 5 activities x 7 bytes each (heat, cool, fan, 4x unknown).
+      // One row per zone (400A = zone 1).
+      uint8_t zone = reg_key - REG_TSTAT_COMFORT + 1;
       const char *names[] = {"home", "away", "sleep", "wake", "manual"};
       for (int i = 0; i < 5; i++) {
         uint8_t base = i * 7;
@@ -1037,11 +1225,12 @@ void InfinitESPComponent::handle_reply_() {
         uint8_t fan = data[base + 2];
         uint8_t rhtg = data[base + 3] >> 4;
         uint8_t rclg = data[base + 3] & 0x0F;
-        const char *unit = bus_uses_celsius() ? "\xc2\xb0" "C" : "\xc2\xb0" "F";
+        // comfort_byte_to_celsius() returns Celsius regardless of the bus unit,
+        // so the label is always °C (the value, not the bus setting, picks it).
         float ht_disp = comfort_byte_to_celsius(htsp);
         float cl_disp = comfort_byte_to_celsius(clsp);
-        ESP_LOGI("InfinitESP", "COMFORT %s: heat=%.1f%s cool=%.1f%s fan=%d rclg=%d rhtg=%d hum_vent=0x%02X unk=[%02X %02X]",
-                 names[i], ht_disp, unit, cl_disp, unit, fan, rclg, rhtg, data[base + 4], data[base + 5], data[base + 6]);
+        ESP_LOGI("InfinitESP", "COMFORT zone=%d %s: heat=%.1f\xc2\xb0" "C cool=%.1f\xc2\xb0" "C fan=%d rclg=%d rhtg=%d hum_vent=0x%02X unk=[%02X %02X]",
+                 zone, names[i], ht_disp, cl_disp, fan, rclg, rhtg, data[base + 4], data[base + 5], data[base + 6]);
       }
     }
 
@@ -1099,6 +1288,191 @@ void InfinitESPComponent::poll_thermostat_() {
   poll_index_++;
 }
 
+void InfinitESPComponent::poll_odu_slow_() {
+  // Rotate over (observed class-5 device, union register) pairs, skipping
+  // entries blacklisted by a FUNC 0x15 refusal this session. "Observed" = any
+  // stored register from that address; passive snooping populates this within
+  // seconds of boot. The flat index is taken modulo the recomputed pair count,
+  // so devices appearing mid-session are picked up and vanished ones drop out.
+  // If every non-blacklisted slot is skipped, the loop just advances the index
+  // with no TX (on a variable-speed unit this settles to 0304-only, i.e. one
+  // frame per 31s).
+  std::vector<uint8_t> odus;
+  for (const auto &akv : device_registers_) {
+    if ((akv.first >> 4) == CLASS_OUTDOOR_UNIT && akv.first != sam_address_)
+      odus.push_back(akv.first);
+  }
+  if (odus.empty())
+    return;  // no ODU observed yet; retry next cycle
+  std::sort(odus.begin(), odus.end());
+  size_t total = odus.size() * ODU_SLOW_POLL_REG_COUNT;
+  for (size_t attempt = 0; attempt < total; attempt++) {
+    size_t slot = odu_slow_poll_index_++ % total;
+    uint8_t addr = odus[slot / ODU_SLOW_POLL_REG_COUNT];
+    uint16_t reg = ODU_SLOW_POLL_REGS[slot % ODU_SLOW_POLL_REG_COUNT];
+    if (odu_unsupported_.count({addr, reg}))
+      continue;  // refused with 0x15 earlier this session
+    ESP_LOGI("InfinitESP", "SLOW POLL ODU %02X for %04X", addr, reg);
+    PendingPoll pp;
+    pp.sent_ms = millis();
+    pp.dest = addr;
+    pp.reg_key = reg;
+    pending_polls_.push_back(pp);
+    diag_reply_expected_++;
+    std::vector<uint8_t> payload = {0x00, (uint8_t) (reg >> 8), (uint8_t) (reg & 0xFF)};
+    send_frame_(addr, 0x01, FUNC_READ, payload);
+    pending_polls_.back().tx_seq = diag_tx_seq_;
+    return;
+  }
+}
+
+void InfinitESPComponent::handle_exception_() {
+  // FUNC 0x15 addressed to us: the device refuses the register. Match the
+  // pending poll by dest + recency — the exception payload is a bare code
+  // (observed 0x04 on a 24VNA9 across 3E01/3E02/3E08/0502) with no register
+  // echo, so register-level matching is impossible. Unambiguous in practice:
+  // only one poll per destination is outstanding (fast poll -> thermostat,
+  // slow polls -> one target per cycle).
+  // Counted as an answered poll (diag_reply_received_) so STATS keeps the
+  // invariant expected = received + timeout; no POLL TIMEOUT warn fires and
+  // reply_timeout stays clean, because the pending is erased here.
+  diag_reply_received_++;
+  for (auto it = pending_polls_.rbegin(); it != pending_polls_.rend(); ++it) {
+    if (it->dest == current_frame_.src) {
+      auto fwd = std::prev(it.base());
+      uint16_t rk = fwd->reg_key;
+      pending_polls_.erase(fwd);
+      if (odu_unsupported_.insert({current_frame_.src, rk}).second) {
+        ESP_LOGI("InfinitESP", "ODU %02X register %04X unsupported (FUNC 0x15) - removed from slow poll",
+                 current_frame_.src, rk);
+      }
+      return;
+    }
+  }
+  ESP_LOGD("InfinitESP", "Unmatched FUNC 0x15 from %02X (pending=%u)",
+           current_frame_.src, (uint32_t) pending_polls_.size());
+}
+
+void InfinitESPComponent::poll_discovery_() {
+  // Probe one observed (device, table) for its 0xNN01 table definition, sent
+  // from ADDR_FAKESAM (0x93). Picks the queryable pair missing a cached name
+  // with the oldest last-query time (so a dropped reply is retried on the next
+  // full sweep rather than never). Skips our own emulated addresses.
+  std::pair<uint8_t, uint8_t> best{0, 0};
+  bool found = false;
+  uint32_t best_ts = UINT32_MAX;
+  for (const auto &akv : device_registers_) {
+    uint8_t addr = akv.first;
+    if (addr == sam_address_ || is_emu_zc_addr_(addr) || addr == ADDR_FAKESAM)
+      continue;  // our own emulated roles, or the phantom itself
+    for (const auto &rkv : akv.second) {
+      uint8_t table = rkv.first >> 8;
+      if (table == 0)
+        continue;  // reg keys are (table<<8|row); table 0 is invalid
+      auto key = std::make_pair(addr, table);
+      if (table_names_.count(key))
+        continue;  // already learned
+      if (no_tabledef_.count(key))
+        continue;  // probed once; row 01 is not a tabledef
+      auto it = discovery_query_ms_.find(key);
+      uint32_t ts = (it == discovery_query_ms_.end()) ? 0 : it->second;
+      if (ts < best_ts) {
+        best_ts = ts;
+        best = key;
+        found = true;
+      }
+    }
+  }
+  if (!found)
+    return;
+  std::vector<uint8_t> payload = {0x00, best.second, TABLEDEF_ROW};
+  transmit_frame_(best.first, 0x01, ADDR_FAKESAM, 0x01, FUNC_READ, payload);
+  discovery_query_ms_[best] = millis();
+  ESP_LOGD("InfinitESP", "DISCOVERY probe %02X for table %02X%02X (as %02X)",
+           best.first, best.second, TABLEDEF_ROW, ADDR_FAKESAM);
+}
+
+void InfinitESPComponent::handle_discovery_reply_() {
+  // Reply to a FakeSAM (0x93) probe. Two probe types are routed here:
+  //  (1) 0xNN01 tabledef probes (poll_discovery_) — parse + cache the table name.
+  //  (2) 3B05 metric-units poll (poll_metric_units_, sam-not-emulated only) —
+  //      read data[1] (0=English/°F, 1=Metric/°C) as the authoritative unit flag.
+  if (current_frame_.payload.size() < 3)
+    return;
+  uint8_t table = current_frame_.payload[1];
+  uint8_t row = current_frame_.payload[2];
+  uint16_t reg_key = (table << 8) | row;
+  if (current_frame_.payload.size() <= 3)
+    return;
+  std::vector<uint8_t> data(current_frame_.payload.begin() + 3, current_frame_.payload.end());
+  store_register_(current_frame_.src, reg_key, data);
+
+  // Metric-units poll reply (3B05, sam not emulated)
+  if (reg_key == REG_SAM_ACCESSORIES && temperature_unit_ == TemperatureUnit::AUTO) {
+    handle_metric_units_reply_(current_frame_.src, reg_key, data);
+    return;
+  }
+
+  // Name lives at [2..9] of the tabledef register (row 0x01), NUL/space padded. Trim
+  // trailing padding; a NUL inside the field ends the name at emit time (c_str()).
+  // Printable check: a table whose 0xNN01 probe returns non-printable bytes has
+  // no self-describing row (table 3E serves live register data there on the
+  // 2-stage/two-capacity family — probes returned temperature bytes that decoded
+  // to garbage names in two user REPORTs). Store no name and remember the pair
+  // so the discovery poller stops retrying it.
+  if (row == TABLEDEF_ROW && data.size() >= 10) {
+    std::string name(data.begin() + 2, data.begin() + 10);
+    while (!name.empty() && (name.back() == '\0' || name.back() == ' '))
+      name.pop_back();
+    bool printable = !name.empty();
+    for (char c : name) {
+      if ((uint8_t) c < 0x20 || (uint8_t) c > 0x7E) {
+        printable = false;
+        break;
+      }
+    }
+    if (!printable) {
+      no_tabledef_.insert({current_frame_.src, table});
+      ESP_LOGI("InfinitESP", "DISCOVERY: %02X table %02X row 01 is not a tabledef - skipping name",
+               current_frame_.src, table);
+      return;
+    }
+    table_names_[{current_frame_.src, table}] = name;
+    ESP_LOGI("InfinitESP", "DISCOVERY: %02X table %02X = '%s' (alloc=%u, rows=%u)",
+             current_frame_.src, table, name.c_str(),
+             data.size() >= 12 ? (unsigned) ((data[10] << 8) | data[11]) : 0,
+             data.size() >= 13 ? (unsigned) data[12] : 0);
+  }
+}
+
+void InfinitESPComponent::handle_metric_units_reply_(uint8_t device_addr, uint16_t reg_key,
+                                                       const std::vector<uint8_t> &data) {
+  // Authoritative F/C flag from 3B05 (sam not emulated, polled) or 3B06
+  // (sam emulated, thermostat push). data[1]: 0=English/°F, 1=Metric/°C.
+  // Verified live 2026-06-26 across 3 unit transitions on an Infinity Touch.
+  if (data.size() < 2)
+    return;
+  bool metric = (data[1] != 0x00);
+  bool first_read = !metric_units_known_;
+  if (first_read || metric != metric_units_) {
+    metric_units_ = metric;
+    metric_units_known_ = true;
+    ESP_LOGI("InfinitESP", "Metric units %s: %s (from %04X data[1]=0x%02X)",
+             first_read ? "detected" : "updated",
+             metric ? "°C" : "°F", reg_key, data[1]);
+  }
+}
+
+void InfinitESPComponent::poll_metric_units_() {
+  // When NOT emulating the SAM, the thermostat doesn't push 3B06 to us, so poll
+  // its 3B05 (accessories — intrinsic config, independent of SAM presence) as
+  // FakeSAM (0x93). Reply routes to handle_discovery_reply_ → handle_metric_units_reply_.
+  // Polled on startup and when the cached value is stale (>5 min).
+  std::vector<uint8_t> payload = {0x00, 0x3B, 0x05};
+  transmit_frame_(ADDR_THERMOSTAT, 0x01, ADDR_FAKESAM, 0x01, FUNC_READ, payload);
+  ESP_LOGD("InfinitESP", "Polling thermostat 3B05 for metric-units (as %02X)", ADDR_FAKESAM);
+}
+
 // --- Register Management ---
 
 void InfinitESPComponent::store_register_(uint8_t addr, uint16_t key, const std::vector<uint8_t> &data) {
@@ -1136,11 +1510,19 @@ const std::vector<uint8_t> *InfinitESPComponent::get_register(uint8_t addr, uint
   return nullptr;
 }
 
-uint8_t InfinitESPComponent::get_active_zones_mask() const {
+uint8_t InfinitESPComponent::get_zone_active_mask() const {
   auto *state = get_register(sam_address_, REG_SAM_STATE);
-  if (state && !state->empty())
-    return state->at(REG3B02_ACTIVE_ZONES);  // bit N = zone N+1 active
+  if (state && state->size() > REG3B02_ACTIVE_ZONES)
+    return state->at(REG3B02_ACTIVE_ZONES);
   return 0;
+}
+
+void InfinitESPComponent::queue_hold_set(uint8_t zone, uint16_t minutes, uint32_t debounce_ms) {
+  if (zone < 1 || zone > 8)
+    return;
+  pending_hold_sets_[zone - 1].minutes = minutes;
+  pending_hold_sets_[zone - 1].until_ms = millis() + debounce_ms;
+  pending_hold_sets_[zone - 1].active = true;
 }
 
 uint16_t InfinitESPComponent::get_zone_hold_duration(uint8_t zone) const {
@@ -1149,11 +1531,20 @@ uint16_t InfinitESPComponent::get_zone_hold_duration(uint8_t zone) const {
   if (!data || data->size() < REG3B03_HOLD_DURATIONS + idx * 2 + 2)
     return 0;
   bool is_holding = (data->at(REG3B03_ZONES_HOLDING) & (1 << idx)) != 0;
+  bool timed = data->size() > REG3B03_TIMED_HOLDS &&
+               (data->at(REG3B03_TIMED_HOLDS) & (1 << idx)) != 0;
   uint16_t dur = ((uint16_t) data->at(REG3B03_HOLD_DURATIONS + idx * 2) << 8) |
                  data->at(REG3B03_HOLD_DURATIONS + idx * 2 + 1);
-  // Carrier protocol: zones_holding bit + duration<=1 = permanent hold
+  // Hold vocabulary on the wire (verified 2026-08-27, issue #25 capture):
+  // zones_holding (byte 11) is the PERMANENT-hold bitmask only; a wall-set
+  // timed hold never sets its bit. A timed hold is zones_holding bit clear +
+  // hold_duration > 0, with REG3B03_TIMED_HOLDS (byte 37) carrying the
+  // corroborating per-zone timer bitmask. Timer-bit set with a zeroed
+  // duration covers the torn final poll before expiry lands.
   if (is_holding && dur <= 1)
     return HOLD_PERMANENT;
+  if (timed && dur == 0)
+    return 1;
   return dur;
 }
 
@@ -1164,7 +1555,18 @@ std::string InfinitESPComponent::format_hold_end(uint16_t hold_minutes) const {
   uint16_t now_min = ((uint16_t) state->at(REG3B02_MINUTES) << 8) |
                      state->at(REG3B02_MINUTES + 1);
   uint16_t end_min = now_min + hold_minutes;
-  if (end_min >= 1440) end_min -= 1440;
+  // The bus carries the hold as minutes-remaining (SAM 3B03) and the clock
+  // separately (SAM 3B02). They are sampled at different instants. Right after
+  // a minute rollover the remaining timer has decremented but the clock has
+  // not, so the sum reads one minute low for a few seconds and the "Hold
+  // until" time flaps once a minute.
+  //
+  // The thermostat pins timed-hold end times to quarter-hour boundaries, so
+  // snapping the sum to the nearest 15 min recovers the true value. The skew
+  // is ±1 min; the snap tolerates ±7. 1440 is a multiple of 15, so the
+  // same-day wrap is preserved.
+  end_min = ((end_min + 7) / 15) * 15;
+  end_min %= 1440;
   uint8_t hr24 = end_min / 60;
   uint8_t mn = end_min % 60;
   uint8_t hr12 = hr24 % 12;
@@ -1178,6 +1580,27 @@ void InfinitESPComponent::mirror_to_sam_(uint16_t reg_key, const std::vector<uin
   store_register_(sam_address_, reg_key, data);
   if (reg_key == REG_SAM_STATE || reg_key == REG_SAM_ZONES)
     sam_state_received_ = true;
+}
+
+void InfinitESPComponent::mirror_damper_to_0319_(uint8_t addr, const std::vector<uint8_t> &damper) {
+  // 0308 carries the 8-byte system-wide damper payload; 0319 is per-controller
+  // state feedback. Used only by the emulated-ZC write path (the physical-ZC
+  // capture stores real 0319 replies directly). The PRIMARY mirrors its four
+  // zones into 0319 bytes 0-3 (bytes 4-7 unused = 0xFF). The SECONDARY returns
+  // all-FF on 0319 (proven from a two-controller wire capture, issue #9: 0x61
+  // returns FF FF FF FF on every 0319 poll — its 0319 is unpopulated), so emulate
+  // that exactly rather than inventing a per-controller model.
+  if (zc_enabled() && addr == (uint8_t)(zc_address_ + 1) && zc_secondary_enabled_()) {
+    std::vector<uint8_t> state_0319(8, 0xFF);
+    store_register_(addr, REG_ZC_ZONE_CONFIG, state_0319);
+    return;
+  }
+  std::vector<uint8_t> state_0319(8);
+  for (uint8_t i = 0; i < 4 && i < damper.size(); i++)
+    state_0319[i] = damper[i];
+  for (uint8_t i = 4; i < 8; i++)
+    state_0319[i] = 0xFF;
+  store_register_(addr, REG_ZC_ZONE_CONFIG, state_0319);
 }
 
 void InfinitESPComponent::poll_register(uint8_t table, uint8_t row) {
@@ -1268,44 +1691,133 @@ void InfinitESPComponent::set_zone_fan(uint8_t zone, uint8_t fan_mode) {
   ESP_LOGI("InfinitESP", "Set zone %d fan=%d", zone, fan_mode);
 }
 
+// --- Vacation (SAM 3B04) domain methods ---
+// Each setter updates the vacation_* member (source of truth for reads) and
+// pushes a SAM.0x3B04 change-frame to the thermostat so the value propagates to
+// the enforced vacation setpoints/fan (deciphered + verified 2026-07-09; see the
+// REG3B04_FLAG_* constants in the header). The thermostat never reads 3B04.
+
+void InfinitESPComponent::push_vacation_frame_(uint8_t flag, uint8_t off, uint8_t val) {
+  std::vector<uint8_t> data(REG3B04_DATA_BYTES, 0xFF);
+  data[0] = 0;
+  data[1] = 0;
+  data[2] = flag;
+  data[off] = val;
+  std::vector<uint8_t> payload = {0x00, 0x3B, 0x04};
+  payload.insert(payload.end(), data.begin(), data.end());
+  send_write_frame_(ADDR_THERMOSTAT, 0x01, payload);
+}
+
+void InfinitESPComponent::set_vacation_days(uint16_t days) {
+  if (days > 365)
+    days = 365;
+  vacation_days_ = days;
+  // hours remaining is a 16-bit BE field at data[4..5] (flag 0x02).
+  uint16_t hours = (uint16_t) days * 24;
+  std::vector<uint8_t> data(REG3B04_DATA_BYTES, 0xFF);
+  data[0] = 0;
+  data[1] = 0;
+  data[2] = REG3B04_FLAG_HOURS;
+  data[4] = (uint8_t)(hours >> 8);
+  data[5] = (uint8_t)(hours & 0xFF);
+  std::vector<uint8_t> payload = {0x00, 0x3B, 0x04};
+  payload.insert(payload.end(), data.begin(), data.end());
+  send_write_frame_(ADDR_THERMOSTAT, 0x01, payload);
+  ESP_LOGI("InfinitESP", "Vacation days=%u (hours=%u) active=%d", days, hours, days > 0);
+}
+
+void InfinitESPComponent::set_vacation_temp(bool is_min, uint8_t temp) {
+  if (is_min)
+    vacation_min_temp_ = temp;
+  else
+    vacation_max_temp_ = temp;
+  push_vacation_frame_(is_min ? REG3B04_FLAG_MIN_TEMP : REG3B04_FLAG_MAX_TEMP, is_min ? 6 : 7, temp);
+  ESP_LOGI("InfinitESP", "Vacation %s temp=%u", is_min ? "min" : "max", temp);
+}
+
+void InfinitESPComponent::set_vacation_humidity(bool is_min, uint8_t value) {
+  if (is_min)
+    vacation_min_humidity_ = value;
+  else
+    vacation_max_humidity_ = value;
+  push_vacation_frame_(is_min ? REG3B04_FLAG_MIN_HUM : REG3B04_FLAG_MAX_HUM, is_min ? 8 : 9, value);
+  ESP_LOGI("InfinitESP", "Vacation %s humidity=%u", is_min ? "min" : "max", value);
+}
+
+void InfinitESPComponent::set_vacation_fan(uint8_t fan_mode) {
+  vacation_fan_ = fan_mode;
+  push_vacation_frame_(REG3B04_FLAG_FAN, 10, fan_mode);
+  ESP_LOGI("InfinitESP", "Vacation fan=%u", fan_mode);
+}
+
+uint8_t InfinitESPComponent::encode_hold_(uint16_t duration, uint8_t idx,
+                                          std::vector<uint8_t> &data) const {
+  // 3B03 hold encoding — three EXCLUSIVE intents (verified 2026-06-30).
+  // The thermostat honors flag 0x02 writes to zones_holding: setting the bit
+  // registers a permanent hold (it adopts duration 0xFFFF itself); clearing the
+  // bit cancels the hold entirely (it zeroes its own countdown timer). Flag 0x80
+  // (override_timer) is IGNORED by the thermostat — never use it for hold control.
+  // Must stay consistent with the reader get_zone_hold_duration().
+  uint8_t hold_offset = REG3B03_HOLD_DURATIONS + (idx * 2);
+  uint16_t bus_dur = (duration > 0 && duration < HOLD_PERMANENT) ? duration : 0;
+  data[hold_offset] = (bus_dur >> 8) & 0xFF;       // big-endian (UBInt16 in Infinitude)
+  data[hold_offset + 1] = bus_dur & 0xFF;
+  if (duration >= HOLD_PERMANENT) {
+    data[REG3B03_ZONES_HOLDING] |= (1 << idx);     // permanent-hold bit (0x02 makes the
+    return CHANGE_HOLD;                            // tstat adopt duration 0xFFFF itself)
+  }
+  // Timed hold: flags 0x82 (hold | override_timer). VERIFIED LIVE 2026-08-27
+  // (issue #25): Z3HOLD!15 armed a real countdown on the Touch (served 3B03
+  // showed byte37 bit set + dur 15 counting down, permanent bit clear, HA
+  // preset Hold Timer; cancel and natural expiry both verified; 120 min and
+  // 1440 min also verified). DURATION FLOOR: 15 min. Writes of 10/12/13/14
+  // are processed (3B0E activity flag) but silently not adopted; 15 works
+  // (3/3, incl. right after rejections). 0x80-alone is insufficient and
+  // 0x02-alone is a cancel (duration ignored; tested live). The pre-2026-08-27
+  // "tstat ignores 0x80" conclusion came from muddy-state tests of 0x80-alone;
+  // see the 2026-08-27 DEVLOG entries.
+  data[REG3B03_ZONES_HOLDING] &= ~(1 << idx);
+  return duration > 0 ? (CHANGE_HOLD | CHANGE_OVERRIDE) : CHANGE_HOLD;
+}
+
 void InfinitESPComponent::set_zone_hold(uint8_t zone, uint16_t duration_minutes) {
   if (!sam_enabled()) return;
   auto *zones_data = get_register(sam_address_, REG_SAM_ZONES);
   if (!zones_data || zones_data->size() < REG3B03_SIZE)
     return;
 
+  // Normalize finite durations onto the thermostat's timed-hold grid. Without
+  // this, sub-floor values are silently not adopted by the thermostat (it
+  // processes the write, raises 3B0E activity, then drops it), so the command
+  // would ACK and do nothing (issue #25, verified 2026-08-27).
+  uint16_t duration = duration_minutes;
+  if (duration > 0 && duration < HOLD_PERMANENT) {
+    duration = normalize_timed_hold(duration);
+    if (duration != duration_minutes)
+      ESP_LOGI("InfinitESP", "Zone %d timed hold %d min rounded to %d (15-min grid)",
+               zone, duration_minutes, duration);
+  }
+
   std::vector<uint8_t> data = *zones_data;
   uint8_t idx = zone - 1;
-
-  uint8_t hold_offset = REG3B03_HOLD_DURATIONS + (idx * 2);
-  // Write as big-endian (UBInt16 in Infinitude parser)
-  data[hold_offset] = (duration_minutes >> 8) & 0xFF;
-  data[hold_offset + 1] = duration_minutes & 0xFF;
-
-  // Set/clear zones_holding bitmask
-  if (duration_minutes > 0) {
-    data[REG3B03_ZONES_HOLDING] |= (1 << idx);
-  } else {
-    data[REG3B03_ZONES_HOLDING] &= ~(1 << idx);
-  }
+  uint8_t flags = encode_hold_(duration, idx, data);
 
   // Update local cache
   data[REG3B03_CHANGE_FLAGS] = 0;
   mirror_to_sam_(REG_SAM_ZONES, data);
 
-  // Use CHANGE_HOLD flag (0x02) + CHANGE_OVERRIDE flag (0x80)
-  uint8_t flags = CHANGE_HOLD | CHANGE_OVERRIDE;
   std::vector<uint8_t> payload = build_sam_write_payload_(0x3B, 0x03, idx, flags, data);
 
   send_write_frame_(ADDR_THERMOSTAT, 0x01, payload);
-  ESP_LOGI("InfinitESP", "Set zone %d hold=%d min (flags=0x%02X)", zone, duration_minutes, flags);
+  ESP_LOGI("InfinitESP", "Set zone %d hold=%d min (flags=0x%02X)", zone, duration, flags);
 }
 
 void InfinitESPComponent::apply_activity(uint8_t zone, uint8_t activity_index, uint16_t hold_duration) {
-  // Look up comfort profile from 400A register data (stored under thermostat address)
-  auto *comfort = get_register(ADDR_THERMOSTAT, REG_TSTAT_COMFORT);
+  // Look up the zone's comfort profile row (400A+zone-1, stored under the
+  // thermostat address). Zone 1's row is NOT substitutable: profiles are per-zone.
+  auto *comfort = get_register(ADDR_THERMOSTAT, comfort_reg_for_zone(zone));
   if (!comfort || comfort->size() < (activity_index + 1) * COMFORT_ENTRY_SIZE) {
-    ESP_LOGW("InfinitESP", "apply_activity: no comfort profile data for activity %d", activity_index);
+    ESP_LOGW("InfinitESP", "apply_activity: no comfort data for zone %d activity %d", zone, activity_index);
     return;
   }
 
@@ -1314,20 +1826,14 @@ void InfinitESPComponent::apply_activity(uint8_t zone, uint8_t activity_index, u
   uint8_t clsp_raw = (*comfort)[base + 1];
   uint8_t fan = (*comfort)[base + 2];
 
-  // Comfort profiles use different encoding than 3B03 setpoints:
-  //   °F mode: comfort bytes = whole °F (same as setpoints, no conversion needed)
-  //   °C mode: comfort bytes = half-degrees (byte/2=°C), setpoints = whole °C
-  // So in °C mode we must convert: comfort_half_degrees → °C → setpoint_whole_°C
-  uint8_t htsp_bus, clsp_bus;
-  if (bus_uses_celsius()) {
-    float ht_c = (float) htsp_raw / 2.0f;
-    float cl_c = (float) clsp_raw / 2.0f;
-    htsp_bus = (uint8_t) roundf(ht_c);
-    clsp_bus = (uint8_t) roundf(cl_c);
-  } else {
-    htsp_bus = htsp_raw;
-    clsp_bus = clsp_raw;
-  }
+  // Convert comfort bytes to the 3B03 setpoint encoding via the shared helpers
+  // (comfort_byte_to_celsius → celsius_to_setpoint) — single source of truth for
+  // the comfort→setpoint transform. Byte-identical to the previous inline branch.
+  // NOTE: comfort_byte_to_celsius() is itself buggy in °C mode (400A is always
+  // °F, not C*2); routing through it here means a future fix to that helper
+  // propagates to apply_activity too.
+  uint8_t htsp_bus = celsius_to_setpoint(comfort_byte_to_celsius(htsp_raw));
+  uint8_t clsp_bus = celsius_to_setpoint(comfort_byte_to_celsius(clsp_raw));
 
   const char *names[] = {"home", "away", "sleep", "wake", "manual"};
   ESP_LOGI("InfinitESP", "Apply activity %s to zone %d: heat=%d->%d cool=%d->%d fan=%d hold=%d min (%s)",
@@ -1347,22 +1853,14 @@ void InfinitESPComponent::apply_activity(uint8_t zone, uint8_t activity_index, u
   data[REG3B03_HEAT_SETPOINTS + idx] = htsp_bus;
   data[REG3B03_COOL_SETPOINTS + idx] = clsp_bus;
 
-  // Set hold duration
-  uint8_t hold_offset = REG3B03_HOLD_DURATIONS + (idx * 2);
-  data[hold_offset] = (hold_duration >> 8) & 0xFF;
-  data[hold_offset + 1] = hold_duration & 0xFF;
-  if (hold_duration > 0) {
-    data[REG3B03_ZONES_HOLDING] |= (1 << idx);
-  } else {
-    data[REG3B03_ZONES_HOLDING] &= ~(1 << idx);
-  }
+  uint8_t hold_flag = encode_hold_(hold_duration, idx, data);
 
   // Update local cache
   data[REG3B03_CHANGE_FLAGS] = 0;
   mirror_to_sam_(REG_SAM_ZONES, data);
 
-  // Write with all change flags set (fan + hold + heat + cool + override)
-  uint8_t flags = CHANGE_FAN | CHANGE_HOLD | CHANGE_HEAT | CHANGE_COOL | CHANGE_OVERRIDE;
+  // Fan + heat + cool change flags, plus the (non-contradictory) hold flag.
+  uint8_t flags = CHANGE_FAN | CHANGE_HEAT | CHANGE_COOL | hold_flag;
   std::vector<uint8_t> payload = build_sam_write_payload_(0x3B, 0x03, idx, flags, data);
 
   send_write_frame_(ADDR_THERMOSTAT, 0x01, payload);
@@ -1381,8 +1879,12 @@ void InfinitESPComponent::set_system_mode(uint8_t mode) {
   std::vector<uint8_t> data = *state_data;
   uint8_t old_stagmode = data[22];
 
-  // stagmode at offset 22: high nibble=stage, low nibble=mode
-  data[22] = (data[22] & 0xF0) | (mode & 0x0F);
+  // stagmode at offset 22: high nibble=stage, low nibble=mode. Clear the stage
+  // nibble (write 0), matching Infinitude's set_system_mode: a mode-change
+  // command with the running stage still asserted (e.g. 0x42) is contradictory
+  // and the thermostat rejects it — observed 0x41 bus not flipping to AUTO
+  // after a 0x42 write. Stage 0 ("mode change, system idle") is accepted.
+  data[22] = mode & 0x0F;
 
   // Update local 3B02 cache so we can serve it when thermostat READs us
   mirror_to_sam_(REG_SAM_STATE, data);
@@ -1407,20 +1909,31 @@ void InfinitESPComponent::set_system_mode(uint8_t mode) {
     std::vector<uint8_t> payload_3b02 = build_sam_write_payload_(0x3B, 0x02, 0x00, CHANGE_MODE, data);
     send_write_frame_(ADDR_THERMOSTAT, 0x01, payload_3b02);
   }
+
+  // System mode is global (one ODU, one stagmode). Propagate the commanded
+  // change to every entity immediately so all zones reflect it in lockstep;
+  // the bus confirm lags, and the per-zone can_update_mode gate would otherwise
+  // leave non-commanding zones on the stale mode until the next idle frame.
+  for (auto *e : entities_)
+    e->on_system_mode_commanded(mode);
 }
 
 // --- Default Register Initialization ---
+
+// Pad/zero-fill a fixed-width ASCII field into a register buffer. Carrier's
+// register layout uses NUL (0x00) padding (not spaces) after the string.
+// File-local; shared by the SAM and ZC device-info seeds in initialize_defaults_().
+static void pad_str(std::vector<uint8_t> &buf, const char *str, size_t width) {
+  size_t slen = strlen(str);
+  for (size_t i = 0; i < width; i++)
+    buf.push_back(i < slen ? (uint8_t) str[i] : 0x00);
+}
 
 void InfinitESPComponent::initialize_defaults_() {
   // --- SAM registers ---
   if (sam_enabled()) {
     // Register 0104 - Device info (120 bytes)
     {
-      auto pad_str = [](std::vector<uint8_t> &buf, const char *str, size_t width) {
-        size_t slen = strlen(str);
-        for (size_t i = 0; i < width; i++)
-        buf.push_back(i < slen ? (uint8_t) str[i] : 0x00);
-      };
       std::vector<uint8_t> data;
       data.reserve(120);
       pad_str(data, "SYSTEM ACCESS MODULE", 24);    // device
@@ -1428,7 +1941,7 @@ void InfinitESPComponent::initialize_defaults_() {
       pad_str(data, __DATE__, 16);                  // software (auto build date)
       pad_str(data, "InfinitESP--SAM", 20);         // model
       pad_str(data, "", 12);                        // reference
-      pad_str(data, "1726ESP32SAM01", 24);              // serial (week 17, 2026 = InfinitESP first working climate)
+      pad_str(data, "1726ESP32SAM01", 24);          // serial (week 17, 2026 = InfinitESP first working climate)
       store_register_(sam_address_, REG_DEVICE_INFO, data);
     }
 
@@ -1472,19 +1985,10 @@ void InfinitESPComponent::initialize_defaults_() {
       store_register_(sam_address_, REG_SAM_ZONES, data);
     }
 
-    // Register 3B04 - Vacation settings (11 bytes)
-    {
-      std::vector<uint8_t> data(11, 0);
-      data[0] = 0;    // active: off
-      data[1] = 0;    // hours low
-      data[2] = 0;    // hours high
-      data[3] = 60;   // min_temp: 60F
-      data[4] = 85;   // max_temp: 85F
-      data[5] = 0;    // min_humidity
-      data[6] = 100;  // max_humidity: 100%
-      data[7] = 0;    // fan_mode: auto
-      store_register_(sam_address_, REG_SAM_VACATION, data);
-    }
+    // SAM register 0x3B04 is NOT seeded: the thermostat never reads it from the
+    // SAM (confirmed by snoop), and 3B04 is a change-notification frame format,
+    // not a flat config (see REG3B04_FLAG_* in the header).
+    // Vacation config lives in the vacation_* members and is pushed on demand.
 
     // Register 3B05 - Accessories (11 bytes)
     {
@@ -1501,21 +2005,28 @@ void InfinitESPComponent::initialize_defaults_() {
     }
 
     // Register 3B06 - Dealer info (52 bytes)
+    // Seed values follow Infinitude's current CarBus::SAM 3B06 guess (our own RE,
+    // not a Carrier source). Only the byte-1 metric_units flag is live-confirmed;
+    // the config fields (deadband/cph/periods/programs) and dealer_name/phone
+    // offsets are guesses. byte 7 was previously guessed 'temp_units' but is
+    // observed 0xFF on Touch (the F/C ASCII codes live only on the RS-232 port,
+    // not in this register). bus_uses_celsius() reads the runtime metric_units_
+    // member (set from the thermostat's 3B06 push), not this seed byte, so the
+    // seed here only affects the cached default register.
     {
-      std::vector<uint8_t> data(52, 0);
-      data[0] = 8;    // backlight
-      data[1] = 1;    // auto_mode
-      data[2] = 0;    // unknown1
-      data[3] = 3;    // deadband
-      data[4] = 4;    // cycles_per_hour
-      data[5] = 4;    // schedule_periods
-      data[6] = 1;    // programs_enabled
-      data[7] = 0x46; // temp_units: 'F'
-      data[8] = 0xFF; // unknown2
-      data[9] = 1;    // unknown_padding[0]
-      // dealer_name at offset 12: 20 bytes
-      strncpy(reinterpret_cast<char *>(&data[12]), "InfinitESP", 20);
-      // dealer_phone at offset 32: 20 bytes (all zeros)
+      std::vector<uint8_t> data(REG3B06_SIZE, 0);
+      data[REG3B06_BACKLIGHT] = 8;           // level 8
+      data[REG3B06_METRIC_UNITS] = 0;        // English (°F)
+      data[REG3B06_DEADBAND] = 3;
+      data[REG3B06_CYCLES_PER_HOUR] = 4;
+      data[REG3B06_SCHEDULE_PERIODS] = 4;
+      data[REG3B06_PROGRAMS_ENABLED] = 1;
+      data[7] = 0xFF;                        // unknown2 (Touch observes 0xFF)
+      data[8] = 0xFF;                        // unknown3
+      data[9] = 1;                           // programs_enabled_2
+      data[10] = 0;                          // metric_units mirror (English)
+      strncpy(reinterpret_cast<char *>(&data[REG3B06_DEALER_NAME]), "InfinitESP", 20);
+      // dealer_phone at offset 32: all zeros
       store_register_(sam_address_, REG_SAM_DEALER, data);
     }
 
@@ -1531,95 +2042,116 @@ void InfinitESPComponent::initialize_defaults_() {
     ESP_LOGI("InfinitESP", "SAM emulation disabled (sam_address=0)");
   }
 
-  // --- Zone Controller registers (address 0x60) ---
-  // Only seeded if zone_controller_address is configured (non-zero).
-  // Based on SYSTXCC4ZC01 captures — see docs/feisley-captures/ZONE_CONTROLLER.md
+  // --- Zone Controller registers ---
+  // Two controllers are emulated when zc_enabled(): the primary at zc_address_
+  // (0x60, system zones 1-4) and a secondary at zc_address_+1 (0x61, zones 5-8),
+  // matching a real two-controller Carrier damper system (issue #9). Each is a
+  // full SYSTXCC4ZC01 with a distinct serial. Based on SYSTXCC4ZC01 captures.
+  //
+  // The secondary (0x61) is only emulated when a zone >4 has a temperature
+  // sensor wired (zc_secondary_enabled_()). An empty 0x61 would still answer
+  // the thermostat's 3405 presence probe and get commissioned, forcing an
+  // 8-zone install even when the system only has zones 1-4 active.
   if (zc_enabled()) {
-    // Register 0104 - Device info (120 bytes)
-    {
-      auto pad_str_zc = [](std::vector<uint8_t> &buf, const char *str, size_t width) {
-        size_t slen = strlen(str);
-        for (size_t i = 0; i < width; i++)
-        buf.push_back(i < slen ? (uint8_t) str[i] : 0x00);
-      };
-      std::vector<uint8_t> data;
-      data.reserve(120);
-      pad_str_zc(data, "INFINITESP ZONE CTRL", 24);  // device
-      pad_str_zc(data, "", 24);                       // location
-      pad_str_zc(data, __DATE__, 16);                 // software
-      pad_str_zc(data, "SYSTXCC4ZC01", 20);           // model (real model so thermostat recognizes it)
-      pad_str_zc(data, "INFD-ZC-01", 12);              // reference
-      pad_str_zc(data, "1726ESP32ZC01", 24);               // serial (week 17, 2026)
-      store_register_(zc_address_, REG_DEVICE_INFO, data);
-    }
+    auto seed_zc = [this](uint8_t zc_addr, const char *serial, bool is_secondary) {
+      // Register 0104 - Device info (120 bytes)
+      {
+        std::vector<uint8_t> data;
+        data.reserve(120);
+        pad_str(data, "INFINITESP ZONE CTRL", 24);  // device
+        pad_str(data, "", 24);                       // location
+        pad_str(data, __DATE__, 16);                 // software
+        pad_str(data, "SYSTXCC4ZC01", 20);           // model (real model so thermostat recognizes it)
+        pad_str(data, "INFD-ZC-01", 12);              // reference
+        pad_str(data, serial, 24);                    // serial (week 17, 2026; unique per controller)
+        store_register_(zc_addr, REG_DEVICE_INFO, data);
+      }
 
-    // Register 0302 - Zone sensor readings (24 bytes, TLV format)
-    // Layout: 4 zones, zone 1 = no sensor (thermostat direct), zones 2-4 have readings.
-    // System values 0x14 and 0x1C are static across all captures.
-    // Per-zone: [tag=0x01, zone_id, value_hi, value_lo] where °F = uint16_BE / 16
-    {
-      // 73°F → 73×16 = 1168 = 0x0490
-      std::vector<uint8_t> data = {
-        0x04, 0x01, 0x00, 0x00,               // header: 4 zones, zone 1 present (no sensor)
-        0x01, 0x02, 0x04, 0x90,               // zone 2: 73°F
-        0x01, 0x03, 0x04, 0x90,               // zone 3: 73°F
-        0x01, 0x04, 0x04, 0x90,               // zone 4: 73°F
-        0x04, 0x14, 0x00, 0x00,               // system value 0x14 (20)
-        0x04, 0x1C, 0x00, 0x00,               // system value 0x1C (28)
-      };
-      store_register_(zc_address_, REG_ZC_ZONE_STATUS, data);
-    }
+      // Register 0302 - Zone sensor readings (24 bytes, TLV format)
+      // Six entries of [tag, id, val_hi, val_lo] in id order:
+      //   z1(0x01) z2(0x02) z3(0x03) z4(0x04) LAT(0x14) HPT(0x1C).
+      // tag 0x01 = present, 0x04 = not installed. °F = uint16_BE / 16.
+      // Each controller reports its OWN four local zones (system zones N..N+3).
+      // Local zone 1 is thermostat-direct (not installed); 2-4 report 73°F until
+      // an external temperature_sensor overrides them. LAT/HPT report
+      // not-installed (InfinitESP has no thermistors on those ports).
+      {
+        // 73°F → 73×16 = 1168 = 0x0490
+        std::vector<uint8_t> data = {
+          0x04, 0x01, 0x00, 0x00,               // local zone 1: not installed (thermostat-direct)
+          0x01, 0x02, 0x04, 0x90,               // local zone 2: 73°F
+          0x01, 0x03, 0x04, 0x90,               // local zone 3: 73°F
+          0x01, 0x04, 0x04, 0x90,               // local zone 4: 73°F
+          0x04, 0x14, 0x00, 0x00,               // LAT (leaving air temp): not installed
+          0x04, 0x1C, 0x00, 0x00,               // HPT: not installed
+        };
+        store_register_(zc_addr, REG_ZC_ZONE_STATUS, data);
+      }
 
-    // Register 0319 - Damper state feedback (8 bytes)
-    // Start with all zones detected; mirrors 0308 writes at runtime.
-    {
-      std::vector<uint8_t> data = {0x0F, 0x0F, 0x0F, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF};
-      store_register_(zc_address_, REG_ZC_ZONE_CONFIG, data);
-    }
+      // Register 0319 - Damper state feedback (8 bytes)
+      // Primary: start all zones detected (0x0F); mirrors 0308 writes at runtime.
+      // Secondary: all-FF — a real secondary's 0319 is unpopulated (issue #9 wire
+      // capture: 0x61 returns FF FF FF FF on every 0319 poll). mirror_damper_to_0319_
+      // keeps it FF; seeding FF avoids a boot-window mismatch.
+      {
+        std::vector<uint8_t> data = is_secondary
+            ? std::vector<uint8_t>{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+            : std::vector<uint8_t>{0x0F, 0x0F, 0x0F, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF};
+        store_register_(zc_addr, REG_ZC_ZONE_CONFIG, data);
+      }
 
-    // Register 030D - Unknown (7 bytes, always zeros)
-    // Shared register number with SAM 030D but different device address
-    {
-      std::vector<uint8_t> data(7, 0);
-      store_register_(zc_address_, REG_SAM_STATUS, data);
-    }
+      // Register 030D - Unknown (7 bytes, always zeros)
+      // Shared register number with SAM 030D but different device address
+      {
+        std::vector<uint8_t> data(7, 0);
+        store_register_(zc_addr, REG_SAM_STATUS, data);
+      }
 
-    // Register 3404 - Heartbeat flag (1 byte)
-    {
-      std::vector<uint8_t> data = {0x00};
-      store_register_(zc_address_, REG_ZC_HEARTBEAT, data);
-    }
+      // Register 3404 - Heartbeat flag (1 byte)
+      {
+        std::vector<uint8_t> data = {0x00};
+        store_register_(zc_addr, REG_ZC_HEARTBEAT, data);
+      }
 
-    // Register 3405 - Presence probe (discovery register, 3 bytes)
-    {
-      std::vector<uint8_t> data = {0x00, 0x00, 0x00};
-      store_register_(zc_address_, REG_ZC_PRESENCE, data);
-    }
+      // Register 3405 - Presence probe (discovery register, 3 bytes)
+      {
+        std::vector<uint8_t> data = {0x00, 0x00, 0x00};
+        store_register_(zc_addr, REG_ZC_PRESENCE, data);
+      }
 
-    // Register 0310 - Cycle counters (12 bytes, 3 key-value entries)
-    // Values from real SYSTXCC4ZC01 capture
-    {
-      std::vector<uint8_t> data = {
-        0x38, 0x00, 0x00, 0x01,
-        0x39, 0x00, 0x00, 0x01,
-        0x2B, 0x00, 0x00, 0x7E,
-      };
-      store_register_(zc_address_, REG_ZC_CYCLES, data);
-    }
+      // Register 0310 - Cycle counters (12 bytes, 3 key-value entries)
+      // Values from real SYSTXCC4ZC01 capture
+      {
+        std::vector<uint8_t> data = {
+          0x38, 0x00, 0x00, 0x01,
+          0x39, 0x00, 0x00, 0x01,
+          0x2B, 0x00, 0x00, 0x7E,
+        };
+        store_register_(zc_addr, REG_ZC_CYCLES, data);
+      }
 
-    // Register 0311 - Runtime hours (12 bytes, 3 key-value entries)
-    // Values from real SYSTXCC4ZC01 capture
-    {
-      std::vector<uint8_t> data = {
-        0x3A, 0x00, 0x00, 0x00,
-        0x3B, 0x00, 0x00, 0x00,
-        0x2C, 0x00, 0x7E, 0xED,
-      };
-      store_register_(zc_address_, REG_ZC_RUNTIME, data);
-    }
+      // Register 0311 - Runtime hours (12 bytes, 3 key-value entries)
+      // Values from real SYSTXCC4ZC01 capture
+      {
+        std::vector<uint8_t> data = {
+          0x3A, 0x00, 0x00, 0x00,
+          0x3B, 0x00, 0x00, 0x00,
+          0x2C, 0x00, 0x7E, 0xED,
+        };
+        store_register_(zc_addr, REG_ZC_RUNTIME, data);
+      }
 
-    ESP_LOGI("InfinitESP", "Initialized %d ZC registers at address 0x%02X",
-    device_registers_[zc_address_].size(), zc_address_);
+      ESP_LOGI("InfinitESP", "Initialized %d ZC registers at address 0x%02X",
+               device_registers_[zc_addr].size(), zc_addr);
+    };
+    seed_zc(zc_address_, "2726ESP32ZC01", false);       // 0x60 — system zones 1-4
+    // Secondary 0x61 only when a zone >4 is configured; otherwise it would be
+    // discovered and commission zones 5-8 that have no sensors.
+    if (zc_secondary_enabled_())
+      seed_zc((uint8_t) (zc_address_ + 1), "2726ESP32ZC02", true);  // 0x61 — system zones 5-8
+    else
+      ESP_LOGI("InfinitESP", "No zones >4 configured — secondary ZC at 0x%02X not emulated",
+               (uint8_t) (zc_address_ + 1));
   }
 }
 
@@ -1627,7 +2159,13 @@ bool InfinitESPComponent::bus_uses_celsius() const {
   switch (temperature_unit_) {
     case TemperatureUnit::CELSIUS:   return true;
     case TemperatureUnit::FAHRENHEIT: return false;
-    case TemperatureUnit::AUTO:       return bus_celsius_detected_;
+    case TemperatureUnit::AUTO:
+      // Prefer the authoritative metric-units flag from 3B06 (sam emulated) or
+      // 3B05 (sam not emulated) — data[1]: 0=English/°F, 1=Metric/°C. Falls back
+      // to the zone-temp heuristic only before the first authoritative read.
+      if (metric_units_known_)
+        return metric_units_;
+      return bus_celsius_detected_;
   }
   return false;  // unreachable
 }
@@ -1896,6 +2434,43 @@ void InfinitESPComponent::log_traffic_(uint8_t src, uint8_t dst, uint8_t func, u
   }
 }
 
+// Emit a JSON string literal (with surrounding quotes) via write_fn, escaping every byte
+// that would break the JSON or the transport: ", \, control chars, and any non-ASCII
+// byte. Non-ASCII bytes (including 0xFF, which is telnet IAC on the ASCII socket) become
+// \u00XX, so the output is pure ASCII and always valid JSON. Batched through a small
+// stack buffer. No heap allocation.
+static void emit_json_string_(void (*write_fn)(const uint8_t *, size_t, void *), void *ctx, const char *s) {
+  char esc[40];
+  size_t m = 0;
+  auto flush = [&]() { if (m) { write_fn((const uint8_t *) esc, m, ctx); m = 0; } };
+  auto put = [&](char c) {
+    if (m == sizeof(esc)) flush();
+    esc[m++] = c;
+  };
+
+  write_fn((const uint8_t *) "\"", 1, ctx);
+  if (s) {
+    for (; *s; ++s) {
+      unsigned char c = (unsigned char) *s;
+      if (c == '"' || c == '\\') {
+        put('\\');
+        put((char) c);
+      } else if (c < 0x20 || c >= 0x7f) {
+        put('\\');
+        put('u');
+        put('0');
+        put('0');
+        put("0123456789ABCDEF"[c >> 4]);
+        put("0123456789ABCDEF"[c & 0x0F]);
+      } else {
+        put((char) c);
+      }
+    }
+  }
+  flush();
+  write_fn((const uint8_t *) "\"", 1, ctx);
+}
+
 void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, size_t, void *), void *ctx) {
   // Stream a JSON diagnostic report via a write callback (UART/TCP socket).
   // Uses only a 256-byte stack buffer — no heap allocation regardless of report size.
@@ -1906,12 +2481,12 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
 
   // Report metadata
   n = snprintf(buf, sizeof(buf),
-    "{\"fw\":\"InfinitESP 0.1\",\"up\":%u,\"bus\":\"%s\","
+    "{\"fw\":\"InfinitESP 0.1\",\"ver\":\"%s\",\"up\":%u,\"bus\":\"%s\","
     "\"sam\":\"%02X\",\"zc\":\"%02X\","
     "\"temp_unit\":\"%s\",\"temp_cfg\":\"%s\","
     "\"rx\":%u,\"tx\":%u,\"crc\":%u,\"exp\":%u,\"got\":%u,\"to\":%u,"
     "\"hwm\":%u,\"ovf\":%u,\"prg\":%u,\"pp\":%u",
-    (unsigned)(millis()/1000), bus_online_?"on":"off",
+    INFINITESP_VERSION, (unsigned)(millis()/1000), bus_online_?"on":"off",
     sam_address_, zc_address_,
     bus_uses_celsius() ? "C" : "F",
     temperature_unit_ == TemperatureUnit::AUTO ? "auto" : temperature_unit_ == TemperatureUnit::CELSIUS ? "C" : "F",
@@ -1927,7 +2502,33 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
   bool first = true;
   for (auto &akv : device_registers_) {
     auto it = akv.second.find(REG_DEVICE_INFO);
-    if (it == akv.second.end()) continue;
+    if (it == akv.second.end()) {
+      // Identity fallback: some thermostats never poll the ODU's 0104 (issue
+      // #21 — the ODU vanished from REPORT dev); the 3E family serves model
+      // and serial at 3E08/3E09 instead. Synthesize the entry so the ODU is
+      // visible with model+serial. Name "ODU" distinguishes it from 0104
+      // device names (e.g. "VAR SPD COMP VERSION").
+      if ((akv.first >> 4) != CLASS_OUTDOOR_UNIT)
+        continue;
+      auto m = akv.second.find(REG_ODU_3E_MODEL);
+      auto s = akv.second.find(REG_ODU_3E_SERIAL);
+      if (m == akv.second.end() || s == akv.second.end())
+        continue;
+      char model[17] = {}, serial[17] = {};
+      memcpy(model, m->second.data(), std::min((size_t) 16, m->second.size()));
+      memcpy(serial, s->second.data(), std::min((size_t) 16, s->second.size()));
+      for (int i = 15; i >= 0 && (model[i] == ' ' || model[i] == 0); i--) model[i] = 0;
+      for (int i = 15; i >= 0 && (serial[i] == ' ' || serial[i] == 0); i--) serial[i] = 0;
+      n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"name\":\"ODU\",\"model\":",
+                   first ? "" : ",", akv.first);
+      write_fn((const uint8_t *) buf, n, ctx);
+      emit_json_string_(write_fn, ctx, model);
+      emit(",\"serial\":");
+      emit_json_string_(write_fn, ctx, serial);
+      emit("}");
+      first = false;
+      continue;
+    }
     auto &d = it->second;
     char name[25] = {}, model[21] = {}, serial[25] = {};
     memcpy(name, d.data(), std::min((size_t)24, d.size()));
@@ -1937,9 +2538,14 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
     rtrim(name, 23);
     rtrim(model, 19);
     rtrim(serial, 23);
-    n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"name\":\"%s\",\"model\":\"%s\",\"serial\":\"%s\"}",
-             first?"":",", akv.first, name, model, serial);
+    n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"name\":", first?"":",", akv.first);
     write_fn((const uint8_t *)buf, n, ctx);
+    emit_json_string_(write_fn, ctx, name);
+    emit(",\"model\":");
+    emit_json_string_(write_fn, ctx, model);
+    emit(",\"serial\":");
+    emit_json_string_(write_fn, ctx, serial);
+    emit("}");
     first = false;
   }
   emit("]");
@@ -1958,7 +2564,18 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
   }
   emit("]");
 
-  // Recent write frame captures (full hex payload)
+  // Learned table names (from 0xNN01 probes as ADDR_FAKESAM)
+  emit(",\"tables\":[");
+  first = true;
+  for (const auto &kv : table_names_) {
+    n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"table\":\"%02X\",\"name\":",
+             first ? "" : ",", kv.first.first, kv.first.second);
+    write_fn((const uint8_t *) buf, n, ctx);
+    emit_json_string_(write_fn, ctx, kv.second.c_str());
+    emit("}");
+    first = false;
+  }
+  emit("]");
   emit(",\"writes\":[");
   first = true;
   for (auto &wc : write_captures_) {
@@ -2001,7 +2618,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
 // --- ZC Zone Temperature Management ---
 
 void InfinitESPComponent::set_zc_temperature_sensor(uint8_t zone, sensor::Sensor *s) {
-  if (zone < 2 || zone > 4) return;
+  if (zone < 2 || zone > 8) return;
   zc_zones_[zone].temp_sensor = s;
   s->add_on_state_callback([this, zone](float value) {
     this->on_zc_sensor_update_(zone, value);
@@ -2009,12 +2626,94 @@ void InfinitESPComponent::set_zc_temperature_sensor(uint8_t zone, sensor::Sensor
 }
 
 void InfinitESPComponent::set_zc_staleness_timeout(uint8_t zone, uint32_t timeout_ms) {
-  if (zone < 2 || zone > 4) return;
+  if (zone < 2 || zone > 8) return;
   zc_zones_[zone].staleness_timeout_ms = timeout_ms;
 }
 
+bool InfinitESPComponent::zc_unit_is_fahrenheit_(const ZCZoneConfig &slot) const {
+  switch (slot.sensor_unit) {
+    case 1: return false;  // explicit °C
+    case 2: return true;   // explicit °F
+    default: return !bus_uses_celsius();  // inherit from bus
+  }
+}
+
+void InfinitESPComponent::register_zc_thermistor_(ZCZoneConfig &slot, uint8_t tlv_id, sensor::Sensor *s) {
+  slot.temp_sensor = s;
+  s->add_on_state_callback([this, &slot, tlv_id](float value) {
+    this->on_zc_thermistor_update_(slot, tlv_id, value);
+  });
+}
+
+void InfinitESPComponent::set_zc_lat_sensor(sensor::Sensor *s) {
+  register_zc_thermistor_(zc_lat_, ZC_ID_LAT, s);
+}
+
+void InfinitESPComponent::set_zc_hpt_sensor(sensor::Sensor *s) {
+  register_zc_thermistor_(zc_hpt_, ZC_ID_HPT, s);
+}
+
+void InfinitESPComponent::on_zc_thermistor_update_(ZCZoneConfig &slot, uint8_t tlv_id, float value) {
+  if (std::isnan(value))
+    return;
+
+  // Convert to °F: respect sensor_unit setting, default inherits from bus
+  bool is_f = zc_unit_is_fahrenheit_(slot);
+  float temp_f = is_f ? value : (value * 9.0f / 5.0f + 32.0f);
+
+  // Wide sanity band (-40..250 °F) covers any real HVAC thermistor (supply air
+  // can exceed the 40-99°F indoor band used for zones). Out of band almost
+  // always means a sensor_unit misconfiguration (e.g. a °F sensor treated as °C
+  // lands at 300°F+). Per the thermistor contract, an untrustworthy reading is
+  // treated as unavailable: revert the entry to not-installed immediately.
+  if (temp_f < ZC_THERMISTOR_MIN_F || temp_f > ZC_THERMISTOR_MAX_F) {
+    ESP_LOGE("InfinitESP", "ZC %02X out of range: %.1f°F (from %.2f%s). Reverting to "
+             "not-installed. Check sensor_unit config.",
+             tlv_id, temp_f, value, is_f ? "F" : "C");
+    slot.last_sensor_value = NAN;
+    write_zc_temp_entry_(zc_address_, tlv_id, 0.0f, false);
+    return;
+  }
+
+  slot.last_sensor_value = value;
+  slot.last_sensor_update_ms = millis();
+  ESP_LOGD("InfinitESP", "ZC %02X sensor: %.2f°%s → %.2f°F",
+           tlv_id, value, is_f ? "F" : "C", temp_f);
+  write_zc_temp_entry_(zc_address_, tlv_id, temp_f, true);
+}
+
+void InfinitESPComponent::write_zc_temp_entry_(uint8_t zc_addr, uint8_t tlv_id, float temp_f, bool present) {
+  if (!zc_enabled())
+    return;
+
+  auto *data = get_register(zc_addr, REG_ZC_ZONE_STATUS);
+  if (!data || data->size() != 24)
+    return;
+
+  // uint16 BE: °F × 16 when present; 0x0000 when not-installed
+  uint16_t raw = present ? (uint16_t)(temp_f * ZC_TEMP_SCALE + 0.5f) : 0x0000;
+  uint8_t tag = present ? ZC_0302_TAG_PRESENT : 0x04;
+  uint8_t hi = (raw >> 8) & 0xFF;
+  uint8_t lo = raw & 0xFF;
+
+  // Scan the six TLV entries [tag, id, hi, lo] for our id, write in place.
+  for (uint8_t e = 0; e + 3 < 24; e += 4) {
+    if ((*data)[e + 1] != tlv_id)
+      continue;
+    if ((*data)[e] == tag && (*data)[e + 2] == hi && (*data)[e + 3] == lo)
+      return;  // no change
+    std::vector<uint8_t> new_data = *data;
+    new_data[e] = tag;
+    new_data[e + 2] = hi;
+    new_data[e + 3] = lo;
+    store_register_(zc_addr, REG_ZC_ZONE_STATUS, new_data);
+    notify_entities_(zc_addr, REG_ZC_ZONE_STATUS);
+    return;
+  }
+}
+
 void InfinitESPComponent::on_zc_sensor_update_(uint8_t zone, float value) {
-  if (std::isnan(value) || zone < 2 || zone > 4) return;
+  if (std::isnan(value) || zone < 2 || zone > 8) return;
   auto &zc = zc_zones_[zone];
 
   // Convert to °F: respect sensor_unit setting, default inherits from bus
@@ -2043,28 +2742,20 @@ void InfinitESPComponent::on_zc_sensor_update_(uint8_t zone, float value) {
   update_zc_zone_temp_(zone, temp_f);
 }
 
+// Zone-number wrapper around write_zc_temp_entry_(): writes the TLV entry for
+// system zone N (present or not-installed) to the controller that serves it.
+// Used by the sensor-fallback loop, which drives installed/not-installed per
+// zone. update_zc_zone_temp_() is the present-only convenience for callbacks.
+void InfinitESPComponent::write_zc_zone_temp_entry_(uint8_t zone, float temp_f, bool present) {
+  if (zone < 2 || zone > 8) return;
+  write_zc_temp_entry_(zc_addr_for_zone_(zone), zc_local_id_for_zone_(zone), temp_f, present);
+}
+
 void InfinitESPComponent::update_zc_zone_temp_(uint8_t zone, float temp_f) {
-  if (!zc_enabled() || zone < 2 || zone > 4) return;
-
-  auto *data = get_register(zc_address_, REG_ZC_ZONE_STATUS);
-  if (!data || data->size() != 24) return;
-
-  // uint16 BE: °F × 16
-  uint16_t raw = (uint16_t) (temp_f * ZC_TEMP_SCALE + 0.5f);
-
-  // Zone N value bytes: offset 4 + (N-2)*4 + 2 (hi) and + 3 (lo)
-  // Zone 2 → bytes 6,7 | Zone 3 → bytes 10,11 | Zone 4 → bytes 14,15
-  uint8_t off_hi = 4 + (zone - 2) * 4 + 2;
-  uint8_t off_lo = off_hi + 1;
-  uint8_t hi = (raw >> 8) & 0xFF;
-  uint8_t lo = raw & 0xFF;
-  if ((*data)[off_hi] == hi && (*data)[off_lo] == lo) return;  // no change
-
-  std::vector<uint8_t> new_data = *data;
-  new_data[off_hi] = hi;
-  new_data[off_lo] = lo;
-  store_register_(zc_address_, REG_ZC_ZONE_STATUS, new_data);
-  notify_entities_(zc_address_, REG_ZC_ZONE_STATUS);
+  if (zone < 2 || zone > 8) return;
+  // System zone N → its controller's local id (1-4). zone N ≠ TLV id N for
+  // zones 5-8, which live on the secondary controller (0x61) as local 1-4.
+  write_zc_temp_entry_(zc_addr_for_zone_(zone), zc_local_id_for_zone_(zone), temp_f, true);
 }
 
 void InfinitESPComponent::check_zc_sensor_fallback_() {
@@ -2080,12 +2771,21 @@ void InfinitESPComponent::check_zc_sensor_fallback_() {
 
   uint32_t now = millis();
 
-  for (uint8_t zone = 2; zone <= 4; zone++) {
+  for (uint8_t zone = 2; zone <= 8; zone++) {
     auto &zc = zc_zones_[zone];
 
     bool has_fresh_sensor = (zc.temp_sensor != nullptr) &&
                             !std::isnan(zc.last_sensor_value) &&
                             ((now - zc.last_sensor_update_ms) < zc.staleness_timeout_ms);
+
+    if (zc.temp_sensor == nullptr) {
+      // No external sensor wired: report not-installed (tag 0x04), matching a
+      // real ZC whose thermistor port has no sensor. This lets the thermostat
+      // see phantom zones (e.g. unused slots on the secondary 0x61 board) as
+      // absent rather than as a zone with a stuck temperature.
+      write_zc_zone_temp_entry_(zone, 0.0f, false);
+      continue;
+    }
 
     float temp_f;
     if (has_fresh_sensor) {
@@ -2098,6 +2798,21 @@ void InfinitESPComponent::check_zc_sensor_fallback_() {
     }
 
     update_zc_zone_temp_(zone, temp_f);
+  }
+
+  // Thermistor ports (LAT 0x14, HPT 0x1C): only managed when a sensor is
+  // configured. When the reading is fresh, the sensor callback already wrote a
+  // present entry — nothing to do here. When stale (or never arrived), revert
+  // the entry to not-installed so the thermostat stops seeing it. Unlike zones,
+  // there is no zone-1-ambient fallback for supply-air temperature.
+  struct Therm { ZCZoneConfig *slot; uint8_t id; };
+  for (auto t : {Therm{&zc_lat_, ZC_ID_LAT}, Therm{&zc_hpt_, ZC_ID_HPT}}) {
+    if (t.slot->temp_sensor == nullptr)
+      continue;  // unconfigured: leave the seed (not-installed) untouched
+    bool fresh = !std::isnan(t.slot->last_sensor_value) &&
+                 ((now - t.slot->last_sensor_update_ms) < t.slot->staleness_timeout_ms);
+    if (!fresh)
+      write_zc_temp_entry_(zc_address_, t.id, 0.0f, false);
   }
 }
 

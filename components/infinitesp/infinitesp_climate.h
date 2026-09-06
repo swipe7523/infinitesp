@@ -1,7 +1,7 @@
 #pragma once
 #include "esphome/components/climate/climate.h"
 #include <cmath>
-#include "../infinitesp.h"
+#include "infinitesp.h"
 
 namespace esphome {
 namespace infinitesp {
@@ -11,6 +11,7 @@ static const char *const PRESET_WAKE = "Wake";
 static const char *const PRESET_HOLD_PERM = "Hold Indefinitely";
 static const char *const PRESET_HOLD_TIMED = "Hold Timer";
 static const char *const PRESET_SCHEDULE = "Per Schedule";
+static const char *const PRESET_VACATION = "Vacation";
 
 // Map from comfort profile activity index to HA preset for readback.
 // Since the bus doesn't carry activity info, we track what WE set.
@@ -20,9 +21,12 @@ static const uint8_t NO_ACTIVITY = 0xFF;
 
 // How long to suppress stale poll data after a setpoint write (ms)
 static const uint32_t PENDING_SETPOINT_WINDOW_MS = 8000;
-// How long to hold a user-selected mode before letting bus polls revert it (ms).
-// Gives the thermostat time to adopt the change; also stops a stray in-flight
-// poll (or a second writer) from bouncing the mode right after the user sets it.
+// How long to hold a COMMANDED system mode before letting bus polls revert it (ms).
+// Gives the thermostat time to adopt the change; the bus confirm lags 1-2 poll
+// cycles, and during that window a stale AUTO-direction nibble (stage>0 on
+// variable-speed gear) would otherwise revert a just-commanded heat/cool via the
+// mode-trust branch. Also stops a stray in-flight poll (or a second writer) from
+// bouncing the mode right after the user sets it.
 static const uint32_t PENDING_MODE_WINDOW_MS = 8000;
 
 class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
@@ -31,13 +35,15 @@ class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
     // Register custom presets on the entity (ClimateTraits::set_supported_custom_presets
     // was deprecated in 2026.5.0). Climate::get_traits() merges these into traits().
     static const char *const custom_presets[] = {
-        PRESET_SCHEDULE, PRESET_WAKE, PRESET_HOLD_TIMED, PRESET_HOLD_PERM};
+        PRESET_SCHEDULE, PRESET_WAKE, PRESET_HOLD_TIMED, PRESET_HOLD_PERM,
+        PRESET_VACATION};
     this->set_supported_custom_presets(custom_presets);
   }
 
   void control(const climate::ClimateCall &call) override;
   climate::ClimateTraits traits() override;
   virtual void on_register_update(uint8_t device_addr, uint16_t register_key) override;
+  void on_system_mode_commanded(uint8_t sys) override;
 
   void set_pending_setpoint_(uint8_t heat, uint8_t cool);
   // Recompute climate action from cached stage/mode + current damper state.
@@ -50,7 +56,7 @@ class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
 
  protected:
   float current_temp_{NAN};
-  uint8_t current_action_{0};
+  climate::ClimateAction current_action_{climate::CLIMATE_ACTION_OFF};
   uint8_t last_stage_{0};   // last stage nibble from 3B02 stagmode
   uint8_t last_mode_{0};    // last mode nibble from 3B02 stagmode (direction when stage>0)
   uint8_t last_odu_dir_{0}; // last ODU 0602 mode nibble (ODU_RUN_COOL/HEAT); 0=unknown
@@ -68,8 +74,9 @@ class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
   uint8_t pending_cool_{0};        // the setpoint we just wrote
   bool pending_active_{false};     // whether we have a pending overlay
 
-  // Pending mode overlay — hold a user-selected mode until the thermostat
-  // confirms it (a poll whose nibble matches) or the window expires.
+  // Pending system-mode overlay — hold a user-commanded mode until the thermostat
+  // confirms it (a poll whose nibble matches) or the window expires, so a stale
+  // AUTO-direction nibble can't revert it. See PENDING_MODE_WINDOW_MS.
   uint32_t pending_mode_until_ms_{0};  // millis() deadline
   uint8_t pending_mode_{0};            // the SYSMODE_* the user just requested
   bool pending_mode_active_{false};    // whether a mode write is awaiting confirmation

@@ -34,18 +34,19 @@ climate::ClimateTraits InfinitESPClimate::traits() {
   traits.add_supported_fan_mode(climate::CLIMATE_FAN_MEDIUM);
   traits.add_supported_fan_mode(climate::CLIMATE_FAN_HIGH);
 
-  // Standard presets map to comfort profile activities from thermostat register 400A.
+  // Standard presets map to comfort profile activities from the zone's comfort
+  // row (thermostat table 40, register 400A+zone-1).
   // NONE = cancel hold (resume schedule).
-  // HOME/AWAY/SLEEP/WAKE = apply that activity's setpoints+fan from 400A with a permanent hold.
+  // HOME/AWAY/SLEEP/WAKE = apply that activity's setpoints+fan with a permanent hold.
   // The thermostat stores 5 activities: home, away, sleep, wake, manual.
   traits.add_supported_preset(climate::CLIMATE_PRESET_HOME);
   traits.add_supported_preset(climate::CLIMATE_PRESET_AWAY);
   traits.add_supported_preset(climate::CLIMATE_PRESET_SLEEP);
 
-  // Custom presets are registered on the entity (in the constructor) rather than
-  // on ClimateTraits — the traits setter was deprecated in 2026.5.0 (removed in
-  // 2026.11.0). Climate::get_traits() merges the entity-owned list into the
-  // returned traits.
+  // Custom presets (including PRESET_VACATION) are registered on the entity (in
+  // the constructor) rather than on ClimateTraits — the traits setter was
+  // deprecated in 2026.5.0 (removed in 2026.11.0). Climate::get_traits() merges
+  // the entity-owned list into the returned traits.
 
   return traits;
 }
@@ -62,8 +63,9 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
       case climate::CLIMATE_MODE_OFF:       sys = SYSMODE_OFF; break;
       default: break;
     }
-    parent_->set_system_mode(sys);
-    sys_mode_ = sys;
+    sys_mode_ = sys;                // set before set_system_mode so the
+                                    // broadcast's self-call is idempotent
+    parent_->set_system_mode(sys);  // propagates to all sibling zones
     // Hold this selection until the thermostat confirms it (a poll whose mode
     // nibble matches) or the window expires. Without this, the next bus poll —
     // or the parallel "System Mode" select writing the same register — can
@@ -84,7 +86,13 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
       cool_sp_ = target_bus;
     }
     parent_->set_zone_setpoint(zone_, heat_sp_, cool_sp_);
-    this->target_temperature = target_c;
+    // Write the active bound, not the target_temperature union alias (which
+    // overlaps low — see CLIMATE union gotcha). HA renders the cool slider from
+    // target_temperature_high and the heat slider from target_temperature_low.
+    if (this->mode == climate::CLIMATE_MODE_HEAT)
+      this->target_temperature_low = target_c;
+    else if (this->mode == climate::CLIMATE_MODE_COOL)
+      this->target_temperature_high = target_c;
     set_pending_setpoint_(heat_sp_, cool_sp_);
   }
   if (call.get_target_temperature_low().has_value()) {
@@ -120,8 +128,9 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
     fan_mode_ = fm;
   }
 
-  // Handle standard presets — activity-based holds using comfort profiles from 400A.
-  // Each maps to a comfort activity applied as a permanent hold.
+  // Handle standard presets — activity-based holds using the zone's comfort row
+  // (comfort profiles from 400A). Each maps to a comfort activity applied as a
+  // permanent hold.
   if (call.get_preset().has_value()) {
     auto preset = call.get_preset().value();
     struct PresetMap { climate::ClimatePreset preset; uint8_t activity; };
@@ -157,11 +166,50 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
       last_activity_ = COMFORT_WAKE;
       this->set_custom_preset_(PRESET_WAKE);
       ESP_LOGI("InfinitESP", "Zone %d: preset WAKE → permanent hold", zone_);
+    } else if (custom == PRESET_VACATION) {
+      // Vacation is reported FROM the bus (setpoint-override detection below);
+      // setting it from HA isn't supported yet (would require writing the vacation
+      // config and triggering the system-wide override). No-op — the detected
+      // state reasserts on the next bus poll.
+      ESP_LOGW("InfinitESP", "Zone %d: setting Vacation from HA is not yet supported", zone_);
     }
     // Hold Timer and Hold Indefinitely are read-only states set from bus data.
     // Users cancel holds via the Per Schedule preset.
   }
 
+  publish_state();
+}
+
+void InfinitESPClimate::on_system_mode_commanded(uint8_t sys) {
+  // Called by the parent's set_system_mode() when ANY source (this zone's
+  // control(), another zone's, or ASCII MODE!) changes the global system mode.
+  // The commanding zone already set sys_mode_ in control(), so the assignment
+  // below is a no-op for it; for sibling zones it updates mode + setpoints in
+  // lockstep rather than waiting for the lagging bus confirm (which the
+  // can_update_mode gate would defer until the next idle frame).
+  //
+  // Always arm the pending-mode window — even for the commanding zone — so a
+  // stale AUTO-direction nibble arriving before the bus confirms can't revert
+  // the just-commanded mode via the mode-trust branch.
+  pending_mode_ = sys;
+  pending_mode_active_ = true;
+  pending_mode_until_ms_ = millis() + PENDING_MODE_WINDOW_MS;
+  if (sys == sys_mode_)
+    return;
+  sys_mode_ = sys;
+  switch (sys) {
+    case SYSMODE_HEAT:  this->mode = climate::CLIMATE_MODE_HEAT; break;
+    case SYSMODE_COOL:  this->mode = climate::CLIMATE_MODE_COOL; break;
+    case SYSMODE_AUTO:  this->mode = climate::CLIMATE_MODE_HEAT_COOL; break;
+    case SYSMODE_EHEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
+    case SYSMODE_OFF:
+    default:            this->mode = climate::CLIMATE_MODE_OFF; break;
+  }
+  // Two-point entity: low/high are the source of truth (never the
+  // target_temperature union alias of low). Each zone uses its own setpoints.
+  this->target_temperature_low = parent_->setpoint_to_celsius(heat_sp_);
+  this->target_temperature_high = parent_->setpoint_to_celsius(cool_sp_);
+  ESP_LOGD("InfinitESP", "Zone %d: system mode broadcast -> %d", zone_, sys);
   publish_state();
 }
 
@@ -175,11 +223,25 @@ void InfinitESPClimate::set_pending_setpoint_(uint8_t heat, uint8_t cool) {
 }
 
 bool InfinitESPClimate::compute_action_() {
-  // stage>0 means the ODU has demand for a mode (Carrier SAM spec). The mode
-  // nibble carries direction during stage>0. Gate per-zone on the damper: a
-  // closed damper means this zone isn't receiving conditioned air even while
-  // the system runs. With no zone controller, zone_damper_open() is always
-  // true (single-zone system, action tracks the system 1:1).
+  // stage>0 means the system has active demand (Carrier SAM spec). Gate
+  // per-zone on the damper: a closed damper means this zone isn't receiving
+  // conditioned air even while the system runs. With no zone controller,
+  // zone_damper_open() is always true (single-zone system, action tracks
+  // the system 1:1).
+  //
+  // Direction (two-layer design):
+  //  1. mode nibble HEAT/COOL/EHEAT → trust it. This covers furnace heating
+  //     (a gas furnace is conventional 2-stage → nibble flips to HEAT during
+  //     active heat). No inference needed.
+  //  2. mode nibble AUTO → read the ODU's own run-status register (0602 byte0
+  //     low nibble: 2=cool, 3=heat), cached in last_odu_dir_ and confirmed by a
+  //     heat-vs-cool bus diff. On variable-speed systems the nibble stays AUTO
+  //     during active operation, so this is the path that resolves the old
+  //     "always IDLE" bug (issue #7). Preferred over inferring from zone demand
+  //     vs setpoints: it is what the equipment is actually doing, so it stays
+  //     correct inside the thermostat's hysteresis band where demand-based
+  //     inference reads deadband and misreports IDLE.
+  //  3. else (no ODU direction yet, e.g. a fresh cycle) → IDLE. Never guess.
   climate::ClimateAction action = climate::CLIMATE_ACTION_IDLE;
   if (last_stage_ > 0 && parent_->zone_damper_open(zone_)) {
     switch (last_mode_) {
@@ -251,29 +313,45 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
         if (compute_action_())
           changed = true;
 
-        // The 3B02 mode nibble is the requested system mode at EVERY stage on this
-        // variable-speed equipment: it stays AUTO even while actively cooling, with
-        // direction resolved separately from the ODU 0602 register (issue #7). So
-        // trust any in-range reading directly — including AUTO during stage>0, which
-        // the old logic skipped, leaving a stale mode (e.g. a sentinel-induced "Off")
-        // stuck until the system next idled. Reject out-of-range nibbles rather than
-        // mapping them to OFF.
+        // The 3B02 mode nibble is overloaded: at stage==0 it is the requested
+        // POLICY (heat/cool/heat_cool/off); at stage>0 some controls rewrite it to
+        // the active DIRECTION. On this variable-speed equipment it stays AUTO even
+        // while actively cooling, and direction is resolved separately from the ODU
+        // 0602 register (issue #7). But Touch controls DO rewrite it to heat/cool
+        // during active 2-stage operation, while legacy UIZ controls keep AUTO
+        // mid-cycle on conventional 2-stage gear (issue #11). So trust any in-range
+        // reading — including AUTO during stage>0, which the old logic skipped,
+        // leaving a stale mode (e.g. a sentinel-induced "Off") stuck until the
+        // system next idled — except in the ONE case where trusting it would flap
+        // the policy heat_cool→cool→heat_cool: an already-established AUTO policy
+        // seeing a HEAT/COOL direction nibble at stage>0. Reject out-of-range
+        // nibbles rather than mapping them to OFF.
+        //   - stage==0: always trust (nibble == policy)
+        //   - stage>0 + AUTO nibble: trust (variable-speed, issue #7; unambiguous)
+        //   - stage>0 + HEAT/COOL/OFF nibble, sys_mode_ != AUTO: trust (direction == policy)
+        //   - stage>0 + HEAT/COOL nibble, sys_mode_ == AUTO: suppress (would flap)
         //
         // Pending mode overlay: after the user picks a mode, hold it until the
         // thermostat confirms (a poll whose nibble matches) or the window expires.
         // This stops an in-flight poll — or the parallel "System Mode" select
         // writing the same register — from bouncing the mode right after it's set.
-        bool suppress_mode = false;
+        bool can_update_mode = false;
         if (pending_mode_active_ && millis() < pending_mode_until_ms_) {
-          if (mode == pending_mode_)
+          if (mode == pending_mode_) {
             pending_mode_active_ = false;  // thermostat adopted our request
-          else
-            suppress_mode = true;          // still waiting — don't revert the user's choice
+            can_update_mode = true;
+          }
+          // else: still waiting — don't revert the user's choice
         } else {
           pending_mode_active_ = false;    // window expired (or none) — trust the bus
+          can_update_mode = true;
         }
+        // Issue #11: a stage>0 direction nibble must never overwrite an already
+        // established AUTO policy, or HA flaps heat_cool→cool→heat_cool.
+        if (stage > 0 && mode != SYSMODE_AUTO && sys_mode_ == SYSMODE_AUTO)
+          can_update_mode = false;
 
-        if (!suppress_mode && mode <= SYSMODE_OFF && mode != sys_mode_) {
+        if (can_update_mode && mode <= SYSMODE_OFF && mode != sys_mode_) {
           sys_mode_ = mode;
           switch (mode) {
             case SYSMODE_HEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
@@ -286,12 +364,11 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
           // Update setpoints based on mode: single target for heat/cool, dual for heat_cool
           float heat_c = parent_->setpoint_to_celsius(heat_sp_);
           float cool_c = parent_->setpoint_to_celsius(cool_sp_);
+          // low/high are the source of truth for this two-point entity; never
+          // write the target_temperature union alias (it overlaps low, so writing
+          // it in cool mode clobbers the heat setpoint).
           this->target_temperature_low = heat_c;
           this->target_temperature_high = cool_c;
-          if (this->mode == climate::CLIMATE_MODE_HEAT)
-            this->target_temperature = heat_c;
-          else if (this->mode == climate::CLIMATE_MODE_COOL)
-            this->target_temperature = cool_c;
           changed = true;
         }
       }
@@ -363,13 +440,10 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
       float cool_c = parent_->setpoint_to_celsius(new_cool);
       if (std::isnan(this->target_temperature_low) || std::isnan(this->target_temperature_high))
         sp_changed = true;  // force publish to initialize HA state
+      // low/high are the source of truth; never write target_temperature
+      // (union alias of low — writing it in cool mode clobbers the heat sp).
       this->target_temperature_low = heat_c;
       this->target_temperature_high = cool_c;
-      // Set single target_temperature for the current mode (HA uses this in heat/cool)
-      if (this->mode == climate::CLIMATE_MODE_HEAT)
-        this->target_temperature = heat_c;
-      else if (this->mode == climate::CLIMATE_MODE_COOL)
-        this->target_temperature = cool_c;
 
       if (sp_changed)
         changed = true;
@@ -402,7 +476,30 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
       auto old_custom = this->get_custom_preset();
       auto old_preset = this->preset;
 
-      if (hold_duration_ > 0) {
+      // Vacation is the highest-priority preset: a system-wide override where the
+      // thermostat forces every zone's setpoints to register 4012's min/max. 4012
+      // itself only carries CONFIG (it reads identically whether vacation is
+      // active or not), so the reliable active signal is the setpoint MATCH:
+      // heat==4012[0] && cool==4012[1]. Confirmed on hardware: vacation ON → all
+      // zones heat/cool == 4012 min/max; OFF → setpoints return to schedule.
+      // 4012 is thermostat-internal and only fetched via slow-poll when emulating
+      // the SAM, so in pure-passive mode vac is null and this is a harmless no-op.
+      bool vacation_active = false;
+      auto *vac = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_VACATION);
+      if (vac && vac->size() >= 2) {
+        uint8_t vac_min = (*vac)[0];  // heat setpoint, same bus encoding as 3B03
+        uint8_t vac_max = (*vac)[1];  // cool setpoint
+        // 0xFF = unconfigured vacation; only match real configured values
+        if (vac_min != 0xFF && vac_max != 0xFF && vac_min <= vac_max &&
+            new_heat == vac_min && new_cool == vac_max) {
+          vacation_active = true;
+          last_activity_ = NO_ACTIVITY;
+          hold_end_time_.clear();
+          this->set_custom_preset_(PRESET_VACATION);
+        }
+      }
+
+      if (!vacation_active && hold_duration_ > 0) {
         // Hold is active — show hold preset and compute end time
         if (hold_duration_ >= InfinitESPComponent::HOLD_PERMANENT) {
           this->set_custom_preset_(PRESET_HOLD_PERM);
@@ -413,12 +510,15 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
           if (!end.empty())
             hold_end_time_ = end;
         }
-      } else {
+      } else if (!vacation_active) {
         hold_end_time_.clear();
-        // No hold — match setpoints+fan against comfort profiles from register 400A.
-        auto *comfort = parent_->get_register(ADDR_THERMOSTAT, REG_TSTAT_COMFORT);
-        ESP_LOGD("InfinitESP", "Zone %d preset match: heat=%d cool=%d fan=%d comfort=%p size=%d",
-                 zone_, new_heat, new_cool, new_fan,
+        // No hold — match setpoints+fan against this zone's comfort profile row
+        // (400A+zone-1). Table 40 is per-zone; matching against zone 1's row
+        // (issue #23) made every other zone fall through to "Per Schedule".
+        uint16_t comfort_reg = comfort_reg_for_zone(zone_);
+        auto *comfort = parent_->get_register(ADDR_THERMOSTAT, comfort_reg);
+        ESP_LOGD("InfinitESP", "Zone %d preset match (reg %04X): heat=%d cool=%d fan=%d comfort=%p size=%d",
+                 zone_, comfort_reg, new_heat, new_cool, new_fan,
                  comfort ? (void*)comfort : nullptr,
                  comfort ? (int)comfort->size() : -1);
         bool matched = false;
