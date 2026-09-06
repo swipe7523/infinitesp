@@ -20,6 +20,10 @@ static const uint8_t NO_ACTIVITY = 0xFF;
 
 // How long to suppress stale poll data after a setpoint write (ms)
 static const uint32_t PENDING_SETPOINT_WINDOW_MS = 8000;
+// How long to hold a user-selected mode before letting bus polls revert it (ms).
+// Gives the thermostat time to adopt the change; also stops a stray in-flight
+// poll (or a second writer) from bouncing the mode right after the user sets it.
+static const uint32_t PENDING_MODE_WINDOW_MS = 8000;
 
 class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
  public:
@@ -63,6 +67,12 @@ class InfinitESPClimate : public climate::Climate, public InfinitESPEntity {
   uint8_t pending_heat_{0};        // the setpoint we just wrote
   uint8_t pending_cool_{0};        // the setpoint we just wrote
   bool pending_active_{false};     // whether we have a pending overlay
+
+  // Pending mode overlay — hold a user-selected mode until the thermostat
+  // confirms it (a poll whose nibble matches) or the window expires.
+  uint32_t pending_mode_until_ms_{0};  // millis() deadline
+  uint8_t pending_mode_{0};            // the SYSMODE_* the user just requested
+  bool pending_mode_active_{false};    // whether a mode write is awaiting confirmation
 };
 
 } // namespace infinitesp

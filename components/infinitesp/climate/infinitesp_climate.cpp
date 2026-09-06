@@ -64,6 +64,13 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
     }
     parent_->set_system_mode(sys);
     sys_mode_ = sys;
+    // Hold this selection until the thermostat confirms it (a poll whose mode
+    // nibble matches) or the window expires. Without this, the next bus poll —
+    // or the parallel "System Mode" select writing the same register — can
+    // revert the mode the instant the user sets it (HA snapback / oscillation).
+    pending_mode_ = sys;
+    pending_mode_active_ = true;
+    pending_mode_until_ms_ = millis() + PENDING_MODE_WINDOW_MS;
   }
 
   // Handle setpoint changes. HA sends target_temperature in heat/cool modes,
@@ -251,7 +258,22 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
         // the old logic skipped, leaving a stale mode (e.g. a sentinel-induced "Off")
         // stuck until the system next idled. Reject out-of-range nibbles rather than
         // mapping them to OFF.
-        if (mode <= SYSMODE_OFF && mode != sys_mode_) {
+        //
+        // Pending mode overlay: after the user picks a mode, hold it until the
+        // thermostat confirms (a poll whose nibble matches) or the window expires.
+        // This stops an in-flight poll — or the parallel "System Mode" select
+        // writing the same register — from bouncing the mode right after it's set.
+        bool suppress_mode = false;
+        if (pending_mode_active_ && millis() < pending_mode_until_ms_) {
+          if (mode == pending_mode_)
+            pending_mode_active_ = false;  // thermostat adopted our request
+          else
+            suppress_mode = true;          // still waiting — don't revert the user's choice
+        } else {
+          pending_mode_active_ = false;    // window expired (or none) — trust the bus
+        }
+
+        if (!suppress_mode && mode <= SYSMODE_OFF && mode != sys_mode_) {
           sys_mode_ = mode;
           switch (mode) {
             case SYSMODE_HEAT: this->mode = climate::CLIMATE_MODE_HEAT; break;
