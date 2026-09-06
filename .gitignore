@@ -12,9 +12,10 @@ __pycache__/
 AGENTS.md
 CLAUDE.md
 DEVLOG.md
+PLAN.md
 .claude/
 private/
 infinitesp-*.yaml
 
-# Reverse-engineering captures + analysis scripts (Anantha cross-reference)
+# Reverse-engineering captures + analysis scripts
 scratchpad/

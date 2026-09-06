@@ -830,7 +830,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     return decode_int16_f_(data, 2 + idx * 4);
   }
   // ODU register 060A (REG_ODU_FAN): outdoor fan current RPM, u16 BE at data[64].
-  // Confirmed by state-tracking vs Anantha outdoor_fan_rpm (385→400 tracked 380→405).
+  // Confirmed by state-tracking vs the thermostat's outdoor_fan_rpm (385→400 tracked 380→405).
   static float odu_outdoor_fan_rpm_(const std::vector<uint8_t> &data) {
     if (data.size() < 66) return NAN;
     return (float) decode_u16_be_(data, 64);
@@ -840,7 +840,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // capture using the OFF->HIGH endpoint discriminator (a field's raw value at
   // settled compressor-OFF, where loads are NOT collinear, plus a non-monotonic
   // OFF/MID/HIGH match) and cross-validated against the thermostat's independent
-  // MQTT stream (Anantha fork: dc_bus_voltage/ipm_temp/pfcm_temp/ac_line_current,
+  // MQTT stream (dc_bus_voltage/ipm_temp/pfcm_temp/ac_line_current,
   // units confirmed there). Each is plausibility-guarded per the repo's
   // reject-bad-data convention. EXV position also lives in 060A but is not yet
   // localized (pinned 0/100% in the available capture); see TODO.md.
@@ -873,7 +873,7 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   }
   // ODU register 0303 (REG_ODU_STATUS2): refrigerant pressures, u16 BE / 16 (psig).
   //   data[2] = suction pressure, data[6] = discharge pressure.
-  // Confirmed across an OFF->HIGH compressor transition vs Anantha MQTT: suction
+  // Confirmed across an OFF->HIGH compressor transition vs the thermostat's MQTT: suction
   // moved COUNTER to the load ramp (133->95 psig) — ruling out collinear coincidence
   // — and discharge matched to <1 psi (184->211). (The register's "4 bytes" label
   // is stale; replies carry >= 8 data bytes.)
@@ -888,9 +888,9 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     return (p >= 0.0f && p <= 700.0f) ? p : NAN;
   }
   // ODU register 0625 (REG_ODU_POWER): inverter/compressor input power, u16 BE
-  // watts at data[0]. Confirmed across a 24h heat+cool capture vs Anantha
+  // watts at data[0]. Confirmed across a 24h heat+cool capture vs the thermostat's
   // instant_power (R²=0.98, ~0 intercept); reads ~0 at standby. This is the ODU's
-  // own power draw — Anantha's whole-system instant_power runs ~1.15× higher
+  // own power draw — the whole-system instant_power runs ~1.15× higher
   // (it also counts the indoor blower), so this is published as ODU power, not
   // relabeled as total system power.
   static float odu_power_w_(const std::vector<uint8_t> &data) {

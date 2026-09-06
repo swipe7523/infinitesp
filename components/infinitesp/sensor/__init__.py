@@ -88,20 +88,20 @@ SENSOR_TYPES = {
     "odu_mode": {"key": "odu_operating_mode", "unit": "", "bus_class": 5},
     # ODU line voltage from register 0304 byte 7 (whole volts, state-independent)
     "odu_line_voltage": {"key": "odu_line_voltage", "unit": "V", "device_class": DEVICE_CLASS_VOLTAGE, "bus_class": 5},
-    # ODU outdoor fan RPM from register 060a data[64] (confirmed vs Anantha MQTT)
+    # ODU outdoor fan RPM from register 060a data[64] (confirmed vs the thermostat's MQTT)
     "odu_fan_rpm": {"key": "odu_fan_rpm", "unit": "RPM", "bus_class": 5},
-    # ODU compressor-inverter telemetry from register 060a (confirmed vs Anantha MQTT
-    # over a 24h capture via the OFF→HIGH endpoint discriminator; units per Anantha registry)
+    # ODU compressor-inverter telemetry from register 060a (confirmed vs the thermostat's MQTT
+    # over a 24h capture via the OFF→HIGH endpoint discriminator; units per the thermostat's registry)
     "odu_dc_bus_voltage": {"key": "odu_dc_bus_voltage", "unit": "V", "device_class": DEVICE_CLASS_VOLTAGE, "bus_class": 5},
     "odu_ac_line_current": {"key": "odu_ac_line_current", "unit": "A", "device_class": DEVICE_CLASS_CURRENT, "bus_class": 5},
     "odu_ipm_temp": {"key": "odu_ipm_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     "odu_pfcm_temp": {"key": "odu_pfcm_temp", "unit": "\u00b0C", "device_class": DEVICE_CLASS_TEMPERATURE, "bus_class": 5},
     # ODU refrigerant pressures from register 0303 u16 BE /16 (psig). Confirmed across
-    # an OFF\u2192HIGH transition vs Anantha (suction counter-trended the compressor ramp).
+    # an OFF\u2192HIGH transition vs the thermostat's MQTT (suction counter-trended the compressor ramp).
     "odu_suction_pressure": {"key": "odu_suction_pressure", "unit": "psi", "device_class": DEVICE_CLASS_PRESSURE, "bus_class": 5},
     "odu_discharge_pressure": {"key": "odu_discharge_pressure", "unit": "psi", "device_class": DEVICE_CLASS_PRESSURE, "bus_class": 5},
     # ODU inverter/compressor input power from register 0625 data[0] u16 BE (W).
-    # Confirmed vs Anantha instant_power over a 24h heat+cool capture (R²=0.98).
+    # Confirmed vs the thermostat's MQTT instant_power over a 24h heat+cool capture (R²=0.98).
     "odu_power": {"key": "odu_power", "unit": "W", "device_class": DEVICE_CLASS_POWER, "bus_class": 5},
     # ODU IEEE754 float32 values from register 061f. idx 1..5 are DELTAS
     # (superheat/subcooling/control \u0394T) and are STATIC TARGETS, not live

@@ -330,7 +330,7 @@ sensor:
   #   offset: 0
   #   datatype: uint8
   # ODU inverter / refrigerant diagnostics (registers 060a, 0303, 0625),
-  # reverse-engineered against the Anantha MQTT oracle. auto_entities does not
+  # reverse-engineered against the thermostat's MQTT oracle. auto_entities does not
   # generate these types, so they are declared explicitly; explicit declarations
   # coexist with (and suppress duplicates of) the generated entity surface.
   - platform: infinitesp

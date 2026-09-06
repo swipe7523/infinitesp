@@ -305,7 +305,7 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
   // ODU register 060A (REG_ODU_FAN): outdoor fan RPM plus the compressor-inverter
   // telemetry block. Offsets/scales reverse-engineered over a 24h heat+cool capture
   // using the OFF→HIGH endpoint discriminator, cross-validated against the
-  // thermostat's independent MQTT stream (Anantha fork). Each decoder is
+  // thermostat's independent MQTT stream. Each decoder is
   // plausibility-guarded in the header and returns NAN on out-of-band data, so a
   // bad frame holds the last good reading rather than publishing garbage.
   if (register_key == REG_ODU_FAN) {
@@ -335,8 +335,8 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
   }
 
   // ODU register 0303 (REG_ODU_STATUS2): refrigerant pressures, psig. Confirmed
-  // across an OFF→HIGH transition vs Anantha — suction moved COUNTER to the load
-  // ramp, ruling out a collinear coincidence.
+  // across an OFF→HIGH transition vs the thermostat's MQTT stream — suction
+  // moved COUNTER to the load ramp, ruling out a collinear coincidence.
   if (register_key == REG_ODU_STATUS2) {
     struct PressField { const char *type; float (*decode)(const std::vector<uint8_t> &); };
     static const PressField press_fields[] = {
@@ -354,9 +354,10 @@ void InfinitESPSensor::on_register_update(uint8_t device_addr, uint16_t register
   }
 
   // ODU register 0625 (REG_ODU_POWER): inverter/compressor input power in watts.
-  // Confirmed vs Anantha instant_power over a 24h heat+cool capture (R²=0.98).
-  // This is the ODU's own draw — Anantha's whole-system figure runs ~1.15× higher
-  // because it also counts the indoor blower — so it is published as ODU power.
+  // Confirmed vs the thermostat's MQTT instant_power over a 24h heat+cool
+  // capture (R²=0.98). This is the ODU's own draw — the whole-system figure runs
+  // ~1.15× higher because it also counts the indoor blower — so it is published
+  // as ODU power.
   if (register_key == REG_ODU_POWER && sensor_type_ == "odu_power") {
     auto *data = parent_->get_register(device_addr, REG_ODU_POWER);
     if (data)

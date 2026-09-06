@@ -834,7 +834,7 @@ void InfinitESPComponent::handle_passive_frame_() {
                  odu_status1_meas_f_(data, 4), odu_status1_meas_f_(data, 5));
       }
 
-      // Outdoor fan RPM (060A data[64]), reverse-engineered against Anantha MQTT
+      // Outdoor fan RPM (060A data[64]), reverse-engineered against the thermostat's MQTT
       // ground truth. (Suction superheat now comes from 0302 idx3 — logged with
       // the other 0302 measurements above — so 0613 is no longer decoded here.)
       if (reg_key == REG_ODU_FAN) {
