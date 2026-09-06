@@ -85,6 +85,12 @@ static const uint16_t REG_TSTAT_WIFI = 0x4608;          // SSID, password, hostn
 
 // Comfort-profile register for a zone (zone 1-8). 400A+zone-1.
 static inline uint16_t comfort_reg_for_zone(uint8_t zone) {
+  // Out of range this would silently resolve to an unrelated thermostat table
+  // (zone 0 -> 0x4009, a schedule row; zone 9 -> 0x4012 = REG_TSTAT_VACATION,
+  // which really is stored). Return an impossible key instead so get_register()
+  // misses and the caller takes its not-found path.
+  if (zone < 1 || zone > 8)
+    return 0;
   return REG_TSTAT_COMFORT + (zone - 1);
 }
 
@@ -118,6 +124,11 @@ enum FaultEntry : uint8_t {
 // True if the entry's time/days fields are plausible (thermostat-sourced entries
 // are; some non-thermostat sources pack other data into these bytes).
 static inline bool fault_entry_time_valid(const std::vector<uint8_t> &data, uint8_t i) {
+  // Self-guarding: both current callers check size() >= FAULT_REG_SIZE first,
+  // but this reads the [70..71] trailer as well as entry i, so carry the
+  // precondition here rather than leaving it for the next caller to remember.
+  if (data.size() < FAULT_REG_SIZE || i >= FAULT_ENTRY_COUNT)
+    return false;
   uint8_t base = i * FAULT_ENTRY_SIZE;
   uint16_t days = ((uint16_t) data[base + FAULT_DAYS_HI] << 8) | data[base + FAULT_DAYS_LO];
   uint16_t trailer = ((uint16_t) data[70] << 8) | data[71];
@@ -138,7 +149,10 @@ static inline int32_t fault_entry_age_minutes(const std::vector<uint8_t> &data, 
 }
 static const uint16_t REG_TSTAT_CLOUD = 0x4609;         // Cloud host, proxy server IP
 static const uint16_t REG_TSTAT_DEALER = 0x460A;        // Dealer name, brand, URL (120 bytes)
-static const uint16_t REG_TSTAT_FAULTS = 0x4202;        // Fault history (10 entries × 7 bytes = 70 bytes)
+static const uint16_t REG_TSTAT_FAULTS = 0x4202;        // Fault history: 10 x 7-byte entries
+                                                       // + a 2-byte day-counter trailer = 72
+                                                       // (FAULT_REG_SIZE). The trailer is
+                                                       // load-bearing for all entry age math.
 
 // Comfort profile layout (registers 400A-4011, 35 bytes each; one per zone)
 // 5 activities × 7 bytes: [heat_sp(1), cool_sp(1), fan_mode(1), rclg_rhtg(1), hum_vent(1), unk5(1), unk6(1)]
@@ -694,7 +708,10 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
 
   // Decode big-endian IEEE754 float32 from byte vector
   static float decode_f32_be_(const std::vector<uint8_t> &data, size_t offset) {
-    if (offset + 4 > data.size())
+    // `offset > size()` first: a caller that computes a negative offset (e.g.
+    // `1 + (idx-1)*4` with idx 0) converts it to a huge size_t, and then
+    // `offset + 4` WRAPS to a small number and sails past the bounds check.
+    if (offset > data.size() || offset + 4 > data.size())
       return NAN;
     // Reorder BE bytes to LE for ESP32
     uint8_t le[4] = {data[offset + 3], data[offset + 2], data[offset + 1], data[offset]};
@@ -705,7 +722,10 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
 
   // Decode big-endian int16 / 16 from byte vector (temperature encoding)
   static float decode_int16_f_(const std::vector<uint8_t> &data, size_t offset) {
-    if (offset + 2 > data.size())
+    // `offset > size()` first: a caller that computes a negative offset (e.g.
+    // `1 + (idx-1)*4` with idx 0) converts it to a huge size_t, and then
+    // `offset + 2` WRAPS to a small number and sails past the bounds check.
+    if (offset > data.size() || offset + 2 > data.size())
       return NAN;
     int16_t raw = (int16_t) (((uint16_t) data[offset] << 8) | data[offset + 1]);
     return (float) raw / 16.0f;
@@ -714,7 +734,10 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
   // Decode raw big-endian uint16 from byte vector. Returns 0 when out of range;
   // accessors that need a NAN sentinel keep their own size guard (below).
   static uint16_t decode_u16_be_(const std::vector<uint8_t> &data, size_t offset) {
-    if (offset + 2 > data.size())
+    // `offset > size()` first: a caller that computes a negative offset (e.g.
+    // `1 + (idx-1)*4` with idx 0) converts it to a huge size_t, and then
+    // `offset + 2` WRAPS to a small number and sails past the bounds check.
+    if (offset > data.size() || offset + 2 > data.size())
       return 0;
     return ((uint16_t) data[offset] << 8) | data[offset + 1];
   }
@@ -1023,11 +1046,10 @@ class InfinitESPComponent : public Component, public uart::UARTDevice {
     std::vector<uint8_t> last_payload;
     uint32_t last_seen_ms{0};
   };
-  // Key: (src << 24) | (dst << 16) | (func << 8) | (reg_key & 0xFF)
-  // Uses reg_key low byte only to keep key in 32 bits — sufficient for traffic grouping
-  // since the table byte is already encoded in reg_key's high byte, which we fold differently.
-  // Actually: key = (src << 24) | (dst << 16) | (func << 8) | ((table ^ row) & 0xFF) is lossy.
-  // Better: use uint64_t or a small struct key.
+  // Full (src, dst, func, reg_key) tuple with a lexicographic ordering — the
+  // whole 16-bit reg_key, not a folded byte, so distinct registers can never
+  // share a traffic-log entry. (An earlier design packed these into 32 bits and
+  // was lossy; this struct is the fix, not a workaround.)
   struct TrafficKey {
     uint8_t src, dst, func;
     uint16_t reg_key;

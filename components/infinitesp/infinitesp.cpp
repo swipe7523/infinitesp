@@ -964,6 +964,17 @@ uint16_t InfinitESPComponent::compute_crc_(const uint8_t *data, uint16_t len) co
 
 void InfinitESPComponent::transmit_frame_(uint8_t dst, uint8_t dst_bus, uint8_t src, uint8_t src_bus, uint8_t func,
                                           const std::vector<uint8_t> &payload) {
+  // The length field is one byte. A longer payload would truncate it while the
+  // CRC still covered every byte, so the receiver would read a short frame, fail
+  // CRC, and then parse the remainder as garbage. Nothing builds a payload that
+  // large today (the largest reply is 3 + a <=252-byte register body = 255,
+  // exactly at the limit), so this is a guard against future drift.
+  if (payload.size() > 255) {
+    ESP_LOGE("InfinitESP", "TX payload %u bytes exceeds the 255-byte frame length field; dropped",
+             (unsigned) payload.size());
+    return;
+  }
+
   std::vector<uint8_t> frame;
   frame.reserve(FRAME_HEADER_SIZE + payload.size() + FRAME_CRC_SIZE);
 
@@ -1058,7 +1069,10 @@ void InfinitESPComponent::handle_read_request_() {
     reply_payload.insert(reply_payload.end(), reg_data->begin(), reg_data->end());
 
     // Debug: log model/serial fields from 0104 to verify register data before TX
-    if (reg_key == REG_DEVICE_INFO && reg_data->size() >= 96) {
+    // 120, not 96: the model field is at [64] width 20 (needs 84) but the serial
+    // is at [96] width 24, so a 96-byte register would let %.*s walk 24 bytes
+    // past the allocation. Both seeded 0104 blocks are exactly 120 bytes.
+    if (reg_key == REG_DEVICE_INFO && reg_data->size() >= 120) {
       ESP_LOGI("InfinitESP", "%s 0104 model: %.*s", is_zc ? "ZC" : "SAM", 20, (const char *) &(*reg_data)[64]);
       ESP_LOGI("InfinitESP", "%s 0104 serial: %.*s", is_zc ? "ZC" : "SAM", 24, (const char *) &(*reg_data)[96]);
     }
@@ -1560,6 +1574,11 @@ void InfinitESPComponent::queue_hold_set(uint8_t zone, uint16_t minutes, uint32_
 }
 
 uint16_t InfinitESPComponent::get_zone_hold_duration(uint8_t zone) const {
+  // Zones are 1-8; every array index below is zone-1. Guarded at runtime as
+  // well as in the YAML schema (cv.int_range(min=1, max=8)) because the C++
+  // API is public and a bad zone here indexes a fixed-size register buffer.
+  if (zone < 1 || zone > 8)
+    return 0;
   auto *data = get_register(sam_address_, REG_SAM_ZONES);
   uint8_t idx = zone - 1;
   if (!data || data->size() < REG3B03_HOLD_DURATIONS + idx * 2 + 2)
@@ -1656,6 +1675,11 @@ void InfinitESPComponent::poll_register(uint8_t table, uint8_t row) {
 // --- Domain Methods ---
 
 void InfinitESPComponent::set_zone_setpoint(uint8_t zone, uint8_t heat_sp, uint8_t cool_sp) {
+  // Zones are 1-8; every array index below is zone-1. Guarded at runtime as
+  // well as in the YAML schema (cv.int_range(min=1, max=8)) because the C++
+  // API is public and a bad zone here indexes a fixed-size register buffer.
+  if (zone < 1 || zone > 8)
+    return;
   if (!sam_enabled()) return;
   auto *zones_data = get_register(sam_address_, REG_SAM_ZONES);
   if (!zones_data || zones_data->size() < REG3B03_SIZE)
@@ -1664,6 +1688,18 @@ void InfinitESPComponent::set_zone_setpoint(uint8_t zone, uint8_t heat_sp, uint8
   // Copy current zones data
   std::vector<uint8_t> data = *zones_data;
   uint8_t idx = zone - 1;
+
+  // Reject a strictly inverted pair. Both bytes are "0 = leave unchanged", so
+  // only check when the caller supplied both. ESPHome rejects low > high when
+  // HA sets both bounds in one call, but two sequential single-bound calls slip
+  // past that, and the ASCII HTSP/CLSP paths bypass it entirely. Deliberately
+  // does NOT enforce a minimum deadband: that is the thermostat's own setting
+  // (3B06 byte 3) and duplicating the rule here risks fighting it.
+  if (heat_sp > 0 && cool_sp > 0 && heat_sp > cool_sp) {
+    ESP_LOGW("InfinitESP", "Zone %u setpoints inverted (heat=%u > cool=%u); not sent",
+             zone, heat_sp, cool_sp);
+    return;
+  }
 
   uint8_t flags = 0;
   if (heat_sp > 0) {
@@ -1704,6 +1740,11 @@ void InfinitESPComponent::set_zone_setpoint(uint8_t zone, uint8_t heat_sp, uint8
 }
 
 void InfinitESPComponent::set_zone_fan(uint8_t zone, uint8_t fan_mode) {
+  // Zones are 1-8; every array index below is zone-1. Guarded at runtime as
+  // well as in the YAML schema (cv.int_range(min=1, max=8)) because the C++
+  // API is public and a bad zone here indexes a fixed-size register buffer.
+  if (zone < 1 || zone > 8)
+    return;
   if (!sam_enabled()) return;
   auto *zones_data = get_register(sam_address_, REG_SAM_ZONES);
   if (!zones_data || zones_data->size() < REG3B03_SIZE)
@@ -1815,6 +1856,11 @@ uint8_t InfinitESPComponent::encode_hold_(uint16_t duration, uint8_t idx,
 }
 
 void InfinitESPComponent::set_zone_hold(uint8_t zone, uint16_t duration_minutes) {
+  // Zones are 1-8; every array index below is zone-1. Guarded at runtime as
+  // well as in the YAML schema (cv.int_range(min=1, max=8)) because the C++
+  // API is public and a bad zone here indexes a fixed-size register buffer.
+  if (zone < 1 || zone > 8)
+    return;
   if (!sam_enabled()) return;
   auto *zones_data = get_register(sam_address_, REG_SAM_ZONES);
   if (!zones_data || zones_data->size() < REG3B03_SIZE)
@@ -1847,6 +1893,16 @@ void InfinitESPComponent::set_zone_hold(uint8_t zone, uint16_t duration_minutes)
 }
 
 void InfinitESPComponent::apply_activity(uint8_t zone, uint8_t activity_index, uint16_t hold_duration) {
+  // Zones are 1-8; every array index below is zone-1. Guarded at runtime as
+  // well as in the YAML schema (cv.int_range(min=1, max=8)) because the C++
+  // API is public and a bad zone here indexes a fixed-size register buffer.
+  if (zone < 1 || zone > 8)
+    return;
+  // Range-check the activity too: comfort_reg_for_zone(zone) with an
+  // out-of-range zone resolves to an unrelated thermostat table (zone 9 lands
+  // on REG_TSTAT_VACATION, which is stored and would pass the size check).
+  if (activity_index >= COMFORT_ACTIVITY_COUNT)
+    return;
   // Look up the zone's comfort profile row (400A+zone-1, stored under the
   // thermostat address). Zone 1's row is NOT substitutable: profiles are per-zone.
   auto *comfort = get_register(ADDR_THERMOSTAT, comfort_reg_for_zone(zone));
@@ -1904,6 +1960,12 @@ void InfinitESPComponent::apply_activity(uint8_t zone, uint8_t activity_index, u
 
 void InfinitESPComponent::set_system_mode(uint8_t mode) {
   if (!sam_enabled()) return;
+  // Reject anything outside the SYSMODE_* enum before it reaches the bus:
+  // data[22]'s low nibble has no defined meaning above SYSMODE_OFF.
+  if (mode > SYSMODE_OFF) {
+    ESP_LOGW("InfinitESP", "Ignoring out-of-range system mode %u (valid 0-%u)", mode, SYSMODE_OFF);
+    return;
+  }
   auto *state_data = get_register(sam_address_, REG_SAM_STATE);
   if (!state_data || state_data->size() < REG3B02_SIZE) {
     ESP_LOGW("InfinitESP", "Set system mode=%d FAILED: no cached 3B02 data", mode);
@@ -2216,6 +2278,22 @@ float InfinitESPComponent::celsius_to_bus_temp(float celsius) const {
   return c_to_f(celsius);
 }
 
+// Convert a float to a bus byte with a defined result for EVERY input.
+// float->integer conversion is undefined behavior outside the destination
+// range (and for NAN) rather than a wraparound, and these helpers are reached
+// from the ESPHome API, which validates NAN and mode but does NOT clamp a
+// target temperature to the entity's visual_min/visual_max.
+static inline uint8_t float_to_bus_byte_(float v) {
+  if (std::isnan(v))
+    return 0;
+  v = roundf(v);
+  if (v <= 0.0f)
+    return 0;
+  if (v >= 255.0f)
+    return 255;
+  return (uint8_t) v;
+}
+
 float InfinitESPComponent::comfort_byte_to_celsius(uint8_t raw) const {
   if (bus_uses_celsius())
     return (float) raw / 2.0f;  // half-degree °C
@@ -2225,8 +2303,8 @@ float InfinitESPComponent::comfort_byte_to_celsius(uint8_t raw) const {
 
 uint8_t InfinitESPComponent::celsius_to_comfort_byte(float celsius) const {
   if (bus_uses_celsius())
-    return (uint8_t) roundf(celsius * 2.0f);  // °C → half-degree
-  return (uint8_t) roundf(c_to_f(celsius));
+    return float_to_bus_byte_(celsius * 2.0f);  // °C → half-degree
+  return float_to_bus_byte_(c_to_f(celsius));
 }
 
 float InfinitESPComponent::setpoint_to_celsius(uint8_t raw) const {
@@ -2237,8 +2315,8 @@ float InfinitESPComponent::setpoint_to_celsius(uint8_t raw) const {
 
 uint8_t InfinitESPComponent::celsius_to_setpoint(float celsius) const {
   if (bus_uses_celsius())
-    return (uint8_t) roundf(celsius);  // whole °C
-  return (uint8_t) roundf(c_to_f(celsius));
+    return float_to_bus_byte_(celsius);  // whole °C
+  return float_to_bus_byte_(c_to_f(celsius));
 }
 
 void InfinitESPComponent::cache_wifi_credentials_(const std::string &ssid, const std::string &password) {
@@ -2342,8 +2420,15 @@ void InfinitESPComponent::update_status_led_() {
   if (status_light_ != nullptr) {
     bool state_changed = (new_state != status_led_state_);
 
-    // For solid states, throttle to 500ms. For blink states, update every 100ms.
-    if (state_changed || (new_state == StatusLedState::BUS_NOT_READY)) {
+    // Blink states must be sampled several times per phase or the update rate
+    // aliases against the phase and the LED stops blinking. WIFI_NOT_READY was
+    // previously missing here, so its 250ms mono phase was sampled at the 500ms
+    // solid-state throttle: 0 transitions, i.e. a steady LED that is
+    // indistinguishable from ALL_GOOD while WiFi is actually down.
+    // Solid states stay on the cheap 500ms throttle.
+    const bool is_blinking = (new_state == StatusLedState::BUS_NOT_READY ||
+                              new_state == StatusLedState::WIFI_NOT_READY);
+    if (state_changed || is_blinking) {
       if (!state_changed && (now - status_light_last_update_ < 100))
         return;
     } else {

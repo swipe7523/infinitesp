@@ -75,26 +75,12 @@ void InfinitESPClimate::control(const climate::ClimateCall &call) {
     pending_mode_until_ms_ = millis() + PENDING_MODE_WINDOW_MS;
   }
 
-  // Handle setpoint changes. HA sends target_temperature in heat/cool modes,
-  // target_temperature_low/high in heat_cool mode.
-  if (call.get_target_temperature().has_value()) {
-    float target_c = call.get_target_temperature().value();
-    uint8_t target_bus = parent_->celsius_to_setpoint(target_c);
-    if (this->mode == climate::CLIMATE_MODE_HEAT) {
-      heat_sp_ = target_bus;
-    } else if (this->mode == climate::CLIMATE_MODE_COOL) {
-      cool_sp_ = target_bus;
-    }
-    parent_->set_zone_setpoint(zone_, heat_sp_, cool_sp_);
-    // Write the active bound, not the target_temperature union alias (which
-    // overlaps low — see CLIMATE union gotcha). HA renders the cool slider from
-    // target_temperature_high and the heat slider from target_temperature_low.
-    if (this->mode == climate::CLIMATE_MODE_HEAT)
-      this->target_temperature_low = target_c;
-    else if (this->mode == climate::CLIMATE_MODE_COOL)
-      this->target_temperature_high = target_c;
-    set_pending_setpoint_(heat_sp_, cool_sp_);
-  }
+  // Setpoint changes arrive ONLY as target_temperature_low/high. This entity
+  // declares CLIMATE_SUPPORTS_TWO_POINT_TARGET_TEMPERATURE, and ESPHome's
+  // ClimateCall::validate_() unconditionally resets target_temperature_ for a
+  // two-point entity ("Cannot set target temperature for climate device with
+  // two-point target temperature"), so a single-target branch here would be
+  // dead code. HA drives both sliders from low/high regardless of mode.
   if (call.get_target_temperature_low().has_value()) {
     float target_c = call.get_target_temperature_low().value();
     uint8_t target_bus = parent_->celsius_to_setpoint(target_c);
