@@ -339,12 +339,6 @@ static const uint8_t ODU_RUN_HEAT = 3;
 // intermittently emits the OPPOSITE direction with this bit set (e.g. 0x53 = heat +
 // transient mid-cooling). Only the steady frames (bit clear) carry the true direction.
 static const uint8_t ODU_RUN_TRANSIENT = 0x10;
-static const uint16_t REG_ODU_COMP_SPEED = 0x0604;  // Compressor speed: target RPM [0..1], current RPM [2..3] (per stage)
-static const uint16_t REG_ODU_DEMAND = 0x0608;     // Compressor drive: requested IDU airflow uint16 at [5..6] (CFM), expansion valve % at [2]
-static const uint16_t REG_ODU_CMD_STAGE = 0x0605;  // Commanded compressor stage (float32 at [0..3]: 0.0/1.0..5.0)
-static const uint16_t REG_ODU_STAGE_INFO = 0x060E;  // Actual stage index (byte 0: 0=off, 1..5=stage)
-static const uint16_t REG_ODU_SETPOINT = 0x060B;   // Target value at byte[2], native °F (label TBD; not confirmed a cooling setpoint)
-static const uint16_t REG_ODU_FLOATS = 0x061F;     // IEEE754 float32 array (superheat, subcooling, etc.)
 //
 // Table 0x3E — 2-stage / two-capacity ODU family (24ANA1, 24ANB7, 25HNB5...).
 // Variable-speed units answer reads in this table with FUNC 0x15 (probed live
