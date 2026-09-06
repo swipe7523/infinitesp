@@ -91,6 +91,49 @@ def _validate_addresses(config):
         _LOGGER.warning("'address' is deprecated, use 'sam_address' instead")
         config[CONF_SAM_ADDRESS] = config.pop(CONF_ADDRESS)
     config.setdefault(CONF_SAM_ADDRESS, 0x92)
+
+    # Address collision checks. Nothing at runtime disambiguates two roles that
+    # share a bus address: initialize_defaults_ seeds both register sets into the
+    # same device_registers_[addr], so the later seed silently overwrites the
+    # earlier (e.g. the ZC's 0104 nameplate replacing the SAM's, which breaks SAM
+    # enrollment). The secondary zone controller is implicit at zc_address + 1,
+    # so it must be checked too — otherwise a config that correctly keeps
+    # zc != sam still collides through the secondary.
+    sam = config.get(CONF_SAM_ADDRESS, 0)
+    zc = config.get(CONF_ZONE_CONTROLLER_ADDRESS, 0)
+
+    emulated = {}  # address -> role name, for roles this component answers as
+    if sam:
+        emulated[sam] = "sam_address"
+    if zc:
+        for addr, role in ((zc, "zone_controller_address"),
+                           ((zc + 1) & 0xFF, "the implicit secondary zone controller "
+                                             "(zone_controller_address + 1)")):
+            if addr in emulated:
+                raise cv.Invalid(
+                    f"Address 0x{addr:02X} is used by both '{emulated[addr]}' and {role}. "
+                    "Each emulated device needs its own bus address."
+                )
+            emulated[addr] = role
+
+    # 0x20 is the thermostat's own address; emulating a device there collides
+    # with the master and breaks every transaction on the bus.
+    for addr, role in emulated.items():
+        if addr == 0x20:
+            raise cv.Invalid(
+                f"'{role}' is 0x20, the thermostat's own bus address. Pick another address."
+            )
+
+    # The IDU/ODU overrides name OTHER devices on the bus; pointing one at an
+    # address we emulate makes this component both poll and answer for it.
+    for key in (CONF_INDOOR_UNIT_ADDRESS, CONF_OUTDOOR_UNIT_ADDRESS):
+        addr = config.get(key, 0)
+        if addr and addr in emulated:
+            raise cv.Invalid(
+                f"'{key}' is 0x{addr:02X}, which is already used by "
+                f"{emulated[addr]}. It must be the address of a real device on the bus."
+            )
+
     return config
 
 

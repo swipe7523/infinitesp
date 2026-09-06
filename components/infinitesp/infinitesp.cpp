@@ -1121,6 +1121,13 @@ void InfinitESPComponent::handle_write_request_() {
     if (reg_key != REG_DEVICE_INFO) {
       store_register_(dest, reg_key, data);
     }
+    // Authoritative metric-units flag. The thermostat PUSHES 3B06 to the
+    // emulated SAM as a WRITE, so this — not handle_reply_ — is the path that
+    // actually fires on a real system. data[1]: 0=English/°F, 1=Metric/°C.
+    if (sam_enabled() && dest == sam_address_ && reg_key == REG_SAM_DEALER &&
+        temperature_unit_ == TemperatureUnit::AUTO) {
+      handle_metric_units_reply_(current_frame_.src, reg_key, data);
+    }
   }
 
   // Send ACK reply (echo the original payload back)
@@ -1201,15 +1208,20 @@ void InfinitESPComponent::handle_reply_() {
         }
       }
 
-      // Authoritative metric-units flag from the thermostat's 3B06 push.
-      // The tstat pushes 3B06 to our emulated SAM (dst=0x92); reply stores it
-      // under src (0x20). data[1]: 0=English/°F, 1=Metric/°C (verified 2026-06-26).
-      // SAM-emulated path only — when not emulating we poll 3B05 instead.
-      if (sam_enabled() && reg_key == REG_SAM_DEALER &&
-          current_frame_.src == ADDR_THERMOSTAT &&
-          temperature_unit_ == TemperatureUnit::AUTO) {
-        handle_metric_units_reply_(current_frame_.src, reg_key, data);
-      }
+    }
+
+    // Authoritative metric-units flag from the thermostat's 3B06.
+    // data[1]: 0=English/°F, 1=Metric/°C (verified 2026-06-26).
+    // MUST stay outside the 3B02/3B03 branch above: nested there, the
+    // reg_key test was unsatisfiable (0x3B06 can never equal 0x3B02/0x3B03),
+    // so this never ran and metric_units_known_ stayed false for the whole
+    // SAM-emulated path, silently degrading unit detection to the zone-temp
+    // heuristic. The thermostat normally *pushes* 3B06 as a WRITE (handled in
+    // handle_write_request_); this covers a REPLY on the same register.
+    if (sam_enabled() && reg_key == REG_SAM_DEALER &&
+        current_frame_.src == ADDR_THERMOSTAT &&
+        temperature_unit_ == TemperatureUnit::AUTO) {
+      handle_metric_units_reply_(current_frame_.src, reg_key, data);
     }
 
     // Log parsed 0x4xxx register contents
@@ -1299,7 +1311,13 @@ void InfinitESPComponent::poll_odu_slow_() {
   // frame per 31s).
   std::vector<uint8_t> odus;
   for (const auto &akv : device_registers_) {
-    if ((akv.first >> 4) == CLASS_OUTDOOR_UNIT && akv.first != sam_address_)
+    // Use the learned/overridden ODU address, not the raw class nibble: the
+    // address-nibble convention is exactly what learn_device_ exists to replace
+    // (this system's IDU sits at 0x3E, class 3). Filtering by nibble here made a
+    // manual outdoor_unit_address: override silently ineffective for this poller
+    // while is_odu_addr() honored it everywhere else. is_odu_addr() falls back to
+    // the nibble until discovery has run, so pre-discovery behavior is unchanged.
+    if (is_odu_addr(akv.first) && akv.first != sam_address_)
       odus.push_back(akv.first);
   }
   if (odus.empty())
@@ -2478,6 +2496,16 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
   auto emit = [&](const char *s) { write_fn((const uint8_t *)s, strlen(s), ctx); };
   char buf[256];
   int n;
+  // snprintf returns the length it WOULD have written, so on truncation n can
+  // exceed sizeof(buf) — writing n bytes would then read past this stack buffer
+  // and leak adjacent stack into the report (which users paste into issues).
+  // Clamp to what was actually written. Also drops a negative encoding error.
+  auto emit_buf = [&](int len) {
+    if (len <= 0)
+      return;
+    size_t w = (size_t) len >= sizeof(buf) ? sizeof(buf) - 1 : (size_t) len;
+    write_fn((const uint8_t *) buf, w, ctx);
+  };
 
   // Report metadata
   n = snprintf(buf, sizeof(buf),
@@ -2495,7 +2523,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
     (unsigned)diag_reply_received_, (unsigned)diag_reply_timeout_,
     (unsigned)diag_uart_hwm_, (unsigned)diag_uart_overflow_events_,
     (unsigned)diag_poll_purged_, (unsigned)pending_polls_.size());
-  write_fn((const uint8_t *)buf, n, ctx);
+  emit_buf(n);
 
   // Devices
   emit(",\"dev\":[");
@@ -2521,7 +2549,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
       for (int i = 15; i >= 0 && (serial[i] == ' ' || serial[i] == 0); i--) serial[i] = 0;
       n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"name\":\"ODU\",\"model\":",
                    first ? "" : ",", akv.first);
-      write_fn((const uint8_t *) buf, n, ctx);
+      emit_buf(n);
       emit_json_string_(write_fn, ctx, model);
       emit(",\"serial\":");
       emit_json_string_(write_fn, ctx, serial);
@@ -2539,7 +2567,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
     rtrim(model, 19);
     rtrim(serial, 23);
     n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"name\":", first?"":",", akv.first);
-    write_fn((const uint8_t *)buf, n, ctx);
+    emit_buf(n);
     emit_json_string_(write_fn, ctx, name);
     emit(",\"model\":");
     emit_json_string_(write_fn, ctx, model);
@@ -2559,7 +2587,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
     const char *fn = key.func==FUNC_READ?"R":key.func==FUNC_REPLY?"P":key.func==FUNC_WRITE?"W":"E";
     n = snprintf(buf, sizeof(buf), "%s\"%02X>%02X %s %04X x%u\"",
              first?"":",", key.src, key.dst, fn, key.reg_key, (unsigned)entry.count);
-    write_fn((const uint8_t *)buf, n, ctx);
+    emit_buf(n);
     first = false;
   }
   emit("]");
@@ -2570,7 +2598,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
   for (const auto &kv : table_names_) {
     n = snprintf(buf, sizeof(buf), "%s{\"address\":\"%02X\",\"table\":\"%02X\",\"name\":",
              first ? "" : ",", kv.first.first, kv.first.second);
-    write_fn((const uint8_t *) buf, n, ctx);
+    emit_buf(n);
     emit_json_string_(write_fn, ctx, kv.second.c_str());
     emit("}");
     first = false;
@@ -2581,10 +2609,10 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
   for (auto &wc : write_captures_) {
     n = snprintf(buf, sizeof(buf), "%s{\"src\":\"%02X\",\"dst\":\"%02X\",\"reg\":\"%04X\",\"hex\":\"",
              first?"":",", wc.src, wc.dst, wc.reg_key);
-    write_fn((const uint8_t *)buf, n, ctx);
+    emit_buf(n);
     for (auto b : wc.payload) {
       n = snprintf(buf, sizeof(buf), "%02X", b);
-      write_fn((const uint8_t *)buf, n, ctx);
+      emit_buf(n);
     }
     emit("\"}");
     first = false;
@@ -2600,7 +2628,7 @@ void InfinitESPComponent::stream_bus_report_(void (*write_fn)(const uint8_t *, s
       n = snprintf(buf, sizeof(buf),
                "%s{\"address\":\"%02X\",\"register\":\"%04X\",\"length\":%u,\"data\":\"",
                first?"":",", akv.first, rkv.first, (unsigned)rkv.second.size());
-      write_fn((const uint8_t *)buf, n, ctx);
+      emit_buf(n);
       // Full hex dump
       for (size_t i = 0; i < rkv.second.size(); i++) {
         char hex[3];
