@@ -153,7 +153,12 @@ void InfinitESPComponent::loop() {
   // Fire debounced timed-hold sets from the setter entities (see
   // queue_hold_set): one write per zone after the target settles.
   for (uint8_t z = 0; z < 8; z++) {
-    if (pending_hold_sets_[z].active && millis() >= pending_hold_sets_[z].until_ms) {
+    // Signed-difference deadline test: until_ms is millis()+debounce and both
+    // wrap, so a plain `millis() >= until_ms` reads as already-due for the
+    // debounce window straddling every ~49.7-day rollover — firing the hold on
+    // whatever value the user last scrolled past instead of the one they settled on.
+    if (pending_hold_sets_[z].active &&
+        (int32_t) (millis() - pending_hold_sets_[z].until_ms) >= 0) {
       pending_hold_sets_[z].active = false;
       ESP_LOGI("InfinitESP", "Zone %u hold set -> %u min", z + 1, pending_hold_sets_[z].minutes);
       set_zone_hold(z + 1, pending_hold_sets_[z].minutes);
@@ -298,7 +303,14 @@ void InfinitESPComponent::loop() {
 
   // Drain due write retransmit (one per iteration, bus-idle gated). Suppresses
   // the fast/slow polls this iteration to avoid back-to-back TX to the thermostat.
-  bool retransmit_sent = false;
+  // One initiated TX per loop iteration. Two READs sent back-to-back with no
+  // reply in between cost replies on this bus (the 44% poll-timeout regression
+  // noted on the slow poll below). A single flag enforces that structurally:
+  // the previous per-class flags (!fast_poll_sent && !retransmit_sent && ...)
+  // had to be repeated at every new gate, and the discovery and metric-units
+  // probes were both missing the slow-poll terms — so they could and did share
+  // an iteration with a thermostat or ODU slow poll.
+  bool initiated_tx = false;
   if (!discovery_holdoff && !pending_retransmits_.empty() && bus_idle_ms > 50 &&
       (int32_t) (pending_retransmits_.front().fire_ms - now) <= 0) {
     auto &r = pending_retransmits_.front();
@@ -307,22 +319,20 @@ void InfinitESPComponent::loop() {
              rk, RETRANSMIT_DELAY_MS, (uint32_t) pending_retransmits_.size());
     send_frame_(r.dst, r.dst_bus, r.func, r.payload);
     pending_retransmits_.pop_front();
-    retransmit_sent = true;
+    initiated_tx = true;
   }
 
-  bool fast_poll_sent = false;
-  if (!discovery_holdoff && sam_enabled() && !retransmit_sent && (now - last_poll_time_ > 3000) && bus_idle_ms > 50) {
+  if (!discovery_holdoff && sam_enabled() && !initiated_tx && (now - last_poll_time_ > 3000) && bus_idle_ms > 50) {
     poll_thermostat_();
     last_poll_time_ = now;
-    fast_poll_sent = true;
+    initiated_tx = true;
   }
 
   // Slow-poll 0x4xxx thermostat config registers on their own schedule.
   // MUST NOT fire in the same loop iteration as the fast poll — sending
   // two READ frames to the same thermostat back-to-back causes the echo
   // drain to eat one of the replies (observed 44% poll timeout rate).
-  bool tstat_slow_sent = false;
-  if (!discovery_holdoff && sam_enabled() && !fast_poll_sent && !retransmit_sent && bus_online_ &&
+  if (!discovery_holdoff && sam_enabled() && !initiated_tx && bus_online_ &&
       (now - last_slow_poll_time_ >= SLOW_POLL_INTERVAL_MS) && bus_idle_ms > 50) {
     // Rotation: one comfort row per set bit in the 3B02 active-zones mask
     // (400A for zone 1, 400B for zone 2, ...) first, then the fixed registers.
@@ -371,27 +381,32 @@ void InfinitESPComponent::loop() {
 
     slow_poll_index_++;
     last_slow_poll_time_ = now;
-    tstat_slow_sent = true;
+    initiated_tx = true;
   }
 
   // ODU slow poll: acquisition backstop for registers the local thermostat
   // never polls (or polls only while its status screen is open). Same one-TX-
   // per-iteration rule; phase-shifted half a cycle from the thermostat slow
   // poll (see last_odu_slow_poll_time_) so they never share an iteration.
-  if (!discovery_holdoff && sam_enabled() && !fast_poll_sent && !retransmit_sent && !tstat_slow_sent &&
+  if (!discovery_holdoff && sam_enabled() && !initiated_tx &&
       bus_online_ && (now - last_odu_slow_poll_time_ >= ODU_SLOW_POLL_INTERVAL_MS) && bus_idle_ms > 50) {
     poll_odu_slow_();
     last_odu_slow_poll_time_ = now;
+    // Claim the slot even though poll_odu_slow_ can return without sending
+    // (every slot blacklisted): erring toward the invariant costs at most one
+    // iteration of delay for the probes below, which retry within milliseconds.
+    initiated_tx = true;
   }
 
   // Table-name discovery: probe one observed device's 0xNN01 register from
   // ADDR_FAKESAM (0x93) when 0x93 is free (not our SAM address). One query
   // per cycle, never in the same iteration as a thermostat poll.
   if (!discovery_holdoff && sam_address_ != ADDR_FAKESAM && bus_online_ &&
-      !fast_poll_sent && !retransmit_sent &&
+      !initiated_tx &&
       (now - last_discovery_poll_ms_ >= DISCOVERY_POLL_INTERVAL_MS) && bus_idle_ms > 50) {
     poll_discovery_();
     last_discovery_poll_ms_ = now;
+    initiated_tx = true;
   }
 
   // Metric-units poll (AUTO mode, NOT emulating the SAM): the thermostat
@@ -404,11 +419,12 @@ void InfinitESPComponent::loop() {
   bool bus_active = (now - last_rx_time_) < 5000;
   if (!discovery_holdoff && temperature_unit_ == TemperatureUnit::AUTO && !sam_enabled() &&
       sam_address_ != ADDR_FAKESAM && bus_active &&
-      !fast_poll_sent && !retransmit_sent && bus_idle_ms > 50 &&
+      !initiated_tx && bus_idle_ms > 50 &&
       (!metric_units_known_ || (now - last_unit_poll_ms_) > 300000) &&
       (now - last_unit_poll_ms_) > 5000) {
     poll_metric_units_();
     last_unit_poll_ms_ = now;
+    initiated_tx = true;
   }
 
   // ZC sensor staleness fallback: check every 10s
@@ -2719,7 +2735,23 @@ void InfinitESPComponent::write_zc_temp_entry_(uint8_t zc_addr, uint8_t tlv_id, 
     return;
 
   // uint16 BE: °F × 16 when present; 0x0000 when not-installed
-  uint16_t raw = present ? (uint16_t)(temp_f * ZC_TEMP_SCALE + 0.5f) : 0x0000;
+  // Scale to the wire's °F x 16. The thermistor sanity band deliberately admits
+  // sub-zero °F (ZC_THERMISTOR_MIN_F = -40), and converting a negative float to
+  // uint16_t is undefined behavior — not a wraparound — so clamp first.
+  //
+  // Clamped at 0 rather than encoded as two's complement on purpose: the 0302
+  // TLV is documented as an UNSIGNED uint16 (°F = value / 16), so a negative
+  // two's-complement value would read back as ~4000 °F on a thermostat that
+  // takes the field at its word. Clamping keeps a defined, low-side-wrong value
+  // instead of a wildly high one. The ODU decoders treat the same physical
+  // quantity as int16 (decode_int16_f_), so the correct encoding for negatives
+  // is genuinely unresolved — settle it against hardware before changing this.
+  float scaled_f = present ? floorf(temp_f * ZC_TEMP_SCALE + 0.5f) : 0.0f;
+  if (scaled_f < 0.0f)
+    scaled_f = 0.0f;
+  else if (scaled_f > 65535.0f)
+    scaled_f = 65535.0f;
+  uint16_t raw = present ? (uint16_t) scaled_f : 0x0000;
   uint8_t tag = present ? ZC_0302_TAG_PRESENT : 0x04;
   uint8_t hi = (raw >> 8) & 0xFF;
   uint8_t lo = raw & 0xFF;
@@ -2794,7 +2826,14 @@ void InfinitESPComponent::check_zc_sensor_fallback_() {
   if (!state || state->size() <= REG3B02_TEMPS) return;
 
   // Zone 1 temp in bus units (°F or °C depending on setting)
-  float z1_bus = (float) (*state)[REG3B02_TEMPS];
+  // 0x00 and 0xFF are the thermostat's unpopulated / no-sensor sentinels — the
+  // same two values the 3B02 unit heuristic rejects. 0x00 shows up during a
+  // thermostat reboot, before it has filled the active-zone slots. Publishing
+  // one as a real reading would hand the thermostat a 0 °F zone (32 °F on a °C
+  // bus) tagged present, and it would call for full heat.
+  uint8_t z1_raw = (*state)[REG3B02_TEMPS];
+  bool z1_valid = (z1_raw != 0x00 && z1_raw != 0xFF);
+  float z1_bus = (float) z1_raw;
   float z1_f = bus_uses_celsius() ? (z1_bus * 9.0f / 5.0f + 32.0f) : z1_bus;
 
   uint32_t now = millis();
@@ -2821,7 +2860,14 @@ void InfinitESPComponent::check_zc_sensor_fallback_() {
       bool is_f = zc_sensor_is_fahrenheit_(zone);
       temp_f = is_f ? zc.last_sensor_value : (zc.last_sensor_value * 9.0f / 5.0f + 32.0f);
     } else {
-      // Fallback: use zone 1 current temperature
+      // Fallback: use zone 1 current temperature. When zone 1 is itself a
+      // sentinel there is no trustworthy source, so leave the TLV entry alone:
+      // the thermostat keeps the last plausible value until either the sensor
+      // recovers or 3B02 repopulates. Deliberately not written as
+      // not-installed — dropping a zone the thermostat has commissioned is a
+      // bigger disruption than a briefly stale temperature.
+      if (!z1_valid)
+        continue;
       temp_f = z1_f;
     }
 

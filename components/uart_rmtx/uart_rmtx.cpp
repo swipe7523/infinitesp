@@ -99,10 +99,23 @@ void RmtTxUARTComponent::setup() {
 void RmtTxUARTComponent::ensure_sym_buf_(size_t needed_symbols) {
   if (sym_buf_cap_ >= needed_symbols)
     return;
-  // Free old, allocate new (internal RAM — RMT reads it via CPU-cached path).
+  // Allocate the new buffer BEFORE releasing the old one, and adopt it only on
+  // success (internal RAM — RMT reads it via the CPU-cached path). The previous
+  // order freed first and set sym_buf_cap_ unconditionally, so a failed malloc
+  // left sym_buf_ null with a non-zero capacity: every later call then hit the
+  // early return above, the buffer was never re-allocated, and write_array kept
+  // handing a null pointer to the encoder — a permanent crash loop, not a
+  // transient one. Keeping the old buffer on failure also means an established
+  // channel degrades to "drop this frame" instead of losing its working buffer.
+  auto *fresh = static_cast<rmt_symbol_word_t *>(malloc(needed_symbols * sizeof(rmt_symbol_word_t)));
+  if (fresh == nullptr) {
+    ESP_LOGE(TAG, "sym_buf alloc failed (%u symbols, %u bytes)", (unsigned) needed_symbols,
+             (unsigned) (needed_symbols * sizeof(rmt_symbol_word_t)));
+    return;
+  }
   if (sym_buf_ != nullptr)
     free(sym_buf_);
-  sym_buf_ = static_cast<rmt_symbol_word_t *>(malloc(needed_symbols * sizeof(rmt_symbol_word_t)));
+  sym_buf_ = fresh;
   sym_buf_cap_ = needed_symbols;
 }
 
@@ -113,6 +126,10 @@ void RmtTxUARTComponent::write_array(const uint8_t *data, size_t len) {
   // Encode the whole frame into sym_buf_ (coalesced line-code symbols).
   const size_t max_sym = LineCodeEncoder::symbols_for_bytes(len);
   this->ensure_sym_buf_(max_sym);
+  // ensure_sym_buf_ leaves the buffer untouched if it could not grow it, so the
+  // caller must check rather than encode into a null or undersized buffer.
+  if (this->sym_buf_ == nullptr || this->sym_buf_cap_ < max_sym)
+    return;
   size_t n = this->line_enc_.encode(data, len, this->sym_buf_, this->sym_buf_cap_);
   if (n == 0)
     return;

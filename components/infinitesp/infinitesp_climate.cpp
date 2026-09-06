@@ -336,7 +336,10 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
         // This stops an in-flight poll — or the parallel "System Mode" select
         // writing the same register — from bouncing the mode right after it's set.
         bool can_update_mode = false;
-        if (pending_mode_active_ && millis() < pending_mode_until_ms_) {
+        // Signed-difference: a plain `millis() < until_ms` reads as expired
+        // across the millis() rollover, dropping the overlay and letting the
+        // bus snap the mode back the instant the user sets it.
+        if (pending_mode_active_ && (int32_t) (millis() - pending_mode_until_ms_) < 0) {
           if (mode == pending_mode_) {
             pending_mode_active_ = false;  // thermostat adopted our request
             can_update_mode = true;
@@ -413,7 +416,9 @@ void InfinitESPClimate::on_register_update(uint8_t device_addr, uint16_t registe
 
       // Pending setpoint overlay: after a write, suppress stale poll data
       // for a window to prevent HA snapback while the thermostat processes the change.
-      if (pending_active_ && millis() < pending_until_ms_) {
+      // Signed-difference: see the mode overlay above — a bare comparison
+      // against the wrapping deadline discards the overlay at rollover.
+      if (pending_active_ && (int32_t) (millis() - pending_until_ms_) < 0) {
         if (new_heat != pending_heat_)
           new_heat = pending_heat_;
         if (new_cool != pending_cool_)
